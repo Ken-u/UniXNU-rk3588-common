@@ -1,0 +1,68 @@
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -335,6 +335,53 @@
+ 
+ int (*PE_halt_restart)(unsigned int type) = NULL;
+ 
++#if defined(__arm64__)
++#include <pexpert/device_tree.h>
++
++/*
++ * Nothing on this kernel implements haltRestart: ArmDTPlatform does not and
++ * PE_halt_restart stays NULL, so every restart request used to return -1 and
++ * leave the CPUs running. A panic with DB_REBOOT_ALWAYS printed "MACH Reboot"
++ * and then sat there until the hardware watchdog fired about 89 s later;
++ * reboot(2) would have done nothing at all.
++ *
++ * Fall back to PSCI SYSTEM_RESET through the conduit the device tree names in
++ * /psci/method ("smc" or "hvc"; "smc" if the node is missing). Only the
++ * SecureDT accessors are used: this can run in the panic path, where IOKit
++ * registry locks may be held and nothing may be allocated.
++ *
++ * Halt is turned into a reset on purpose. PSCI SYSTEM_OFF powers the board
++ * down and it has no remote power-on, so a "halt" has to leave it recoverable.
++ */
++static int
++pe_psci_system_reset(void)
++{
++	DTEntry entry;
++	char const *method = NULL;
++	unsigned int size = 0;
++	bool hvc = false;
++
++	if (SecureDTFindEntry("name", "psci", &entry) == kSuccess &&
++	    SecureDTGetProperty(entry, "method", (void const **)&method, &size) == kSuccess &&
++	    method != NULL && size >= 3 && method[0] == 'h' && method[1] == 'v' && method[2] == 'c') {
++		hvc = true;
++	}
++
++	register uint64_t x0 __asm__ ("x0") = 0x84000009ULL; /* SYSTEM_RESET, SMC64/HVC64 */
++	register uint64_t x1 __asm__ ("x1") = 0;
++	register uint64_t x2 __asm__ ("x2") = 0;
++	register uint64_t x3 __asm__ ("x3") = 0;
++	if (hvc) {
++		__asm__ volatile ("hvc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "memory");
++	} else {
++		__asm__ volatile ("smc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "memory");
++	}
++	for (;;) {
++		__asm__ volatile ("wfe");
++	}
++}
++#endif /* __arm64__ */
++
+ int
+ IOPlatformExpert::haltRestart(unsigned int type)
+ {
+@@ -363,6 +410,11 @@
+ 	if (PE_halt_restart) {
+ 		return (*PE_halt_restart)(type);
+ 	} else {
++#if defined(__arm64__)
++		if (type == kPEHaltCPU || type == kPERestartCPU || type == kPEPanicRestartCPU) {
++			(void)pe_psci_system_reset();
++		}
++#endif
+ 		return -1;
+ 	}
+ }

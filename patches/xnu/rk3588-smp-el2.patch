@@ -1,0 +1,163 @@
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -90,6 +90,32 @@
+ #endif /* defined(KERNEL_INTEGRITY_KTRR) */
+ .endmacro
+ 
++#if defined(BCM2837)
++/*
++ * rk3588: per-core boot breadcrumbs. A core that is still running with its MMU off cannot be inspected any other way, so
++ * each stage of the reset path records itself in rk3588_smp_trace (physical memory, 64 bytes per core, indexed by MPIDR
++ * Affinity1 which is the core number on RK3588) for the boot CPU to read back:
++ *   [0] stage   [1] CurrentEL at entry   [2] MPIDR   [3] CurrentEL after the EL2 drop
++ *   [4] cpu data PA   [5] reset handler   [6] SCTLR_EL1 just before the MMU is enabled   [7] unused
++ * All stores happen with the MMU off (device ordering, straight to memory) and the area sits next to ResetHandlerData,
++ * which the boot CPU cleans to memory before every PSCI CPU_ON.
++ * RK3588_TRACE_LINE leaves the core's line in x16 and clobbers x17.
++ */
++.macro RK3588_TRACE_LINE
++	mrs		x16, MPIDR_EL1
++	ubfx	x16, x16, #8, #3
++	adrp	x17, EXT(rk3588_smp_trace)@page
++	add		x17, x17, EXT(rk3588_smp_trace)@pageoff
++	add		x16, x17, x16, lsl #6
++.endmacro
++
++.macro RK3588_TRACE_STAGE
++	mov		w17, #$0
++	str		w17, [x16]
++	dsb		sy
++.endmacro
++#endif /* defined(BCM2837) */
++
+ /*
+  * Checks the reset handler for global and CPU-specific reset-assist functions,
+  * then jumps to the reset handler with boot args and cpu data. This is copied
+@@ -127,6 +153,71 @@
+ 	.align	7
+ 	.globl EXT(reset_vector)
+ LEXT(reset_vector)
++#if defined(BCM2837)
++	/*
++	 * rk3588: a core started by PSCI CPU_ON comes up at the exception level the firmware keeps the non-secure world at,
++	 * and on RK3588 that is EL2 (TF-A returns to the entry point with SCR_EL3.HCE set; U-Boot and the UEFI firmware are
++	 * entered at EL2 as well). XNU only runs at EL1, so drop this core the same way the firmware drops the boot CPU
++	 * (UniXNUHelper.S): EL1 is AArch64, nothing is trapped, there is no stage 2, EL1 owns the physical timer and the
++	 * GICv3 CPU interface. Then carry on below at EL1. A core that already enters at EL1 skips all of this.
++	 */
++	RK3588_TRACE_LINE
++	mrs		x17, CurrentEL
++	str		x17, [x16, #8]
++	mrs		x17, MPIDR_EL1
++	str		x17, [x16, #16]
++	RK3588_TRACE_STAGE 1
++	mrs		x17, CurrentEL
++	cmp		x17, #(2 << 2)
++	b.ne	Lrk3588_at_el1
++	mov		x17, #(1 << 31)						// HCR_EL2: EL1 is AArch64, every other bit clear
++	msr		HCR_EL2, x17
++	mrs		x17, CNTHCTL_EL2						// EL1 may use the physical counter and timer
++	orr		x17, x17, #3
++	msr		CNTHCTL_EL2, x17
++	msr		CNTVOFF_EL2, xzr
++	mrs		x17, ID_AA64PFR0_EL1					// GICv3 system register interface for EL1
++	ubfx	x17, x17, #24, #4
++	cbz		x17, Lrk3588_no_gic_sre
++	mrs		x17, S3_4_C12_C9_5						// ICC_SRE_EL2 |= Enable | SRE
++	orr		x17, x17, #(1 << 0)
++	orr		x17, x17, #(1 << 3)
++	msr		S3_4_C12_C9_5, x17
++	isb
++Lrk3588_no_gic_sre:
++	mov		x17, #0x33ff						// CPTR_EL2: no FP/SIMD traps (RES1 pattern, no SVE)
++	msr		CPTR_EL2, x17
++	mrs		x17, MIDR_EL1						// EL1 sees the real MIDR/MPIDR
++	msr		VPIDR_EL2, x17
++	mrs		x17, MPIDR_EL1
++	msr		VMPIDR_EL2, x17
++	mov		x17, xzr							// MDCR_EL2: no debug/PMU traps, HPMN = every counter
++	mrs		x16, ID_AA64DFR0_EL1
++	ubfx	x16, x16, #8, #4					// PMUVer
++	cbz		x16, Lrk3588_no_pmu
++	cmp		x16, #0xf
++	b.eq	Lrk3588_no_pmu
++	mrs		x17, PMCR_EL0
++	ubfx	x17, x17, #11, #5					// PMCR_EL0.N
++Lrk3588_no_pmu:
++	msr		MDCR_EL2, x17
++	mov		x17, #0x0800						// SCTLR_EL1: MMU, caches and alignment checks off, RES1 bits set
++	movk	x17, #0x30d0, lsl #16
++	msr		SCTLR_EL1, x17
++	mov		x17, #0x3c5							// SPSR_EL2: EL1h with D, A, I and F masked
++	msr		SPSR_EL2, x17
++	adr		x17, Lrk3588_at_el1
++	msr		ELR_EL2, x17
++	isb
++	eret
++	dsb		nsh									// no speculation past the eret
++	isb
++Lrk3588_at_el1:
++	RK3588_TRACE_LINE
++	mrs		x17, CurrentEL
++	str		x17, [x16, #24]
++	RK3588_TRACE_STAGE 2
++#endif /* defined(BCM2837) */
+ 	// Preserve x0 for start_first_cpu, if called
+ 	// Unlock the core for debugging
+ 	msr		OSLAR_EL1, xzr
+@@ -170,6 +261,12 @@
+ 	add		x20, x20, EXT(const_boot_args)@pageoff
+ 	ldr		x0, [x21, CPU_RESET_HANDLER]		// Call CPU reset handler
+ 	cbz		x0, Lskip_cpu_reset_handler
++#if defined(BCM2837)
++	RK3588_TRACE_LINE
++	str		x21, [x16, #32]
++	str		x0, [x16, #40]
++	RK3588_TRACE_STAGE 3
++#endif
+ 
+ 	// Validate that our handler is one of the two expected handlers
+ 	adrp	x2, EXT(resume_idle_cpu)@page
+@@ -213,6 +310,15 @@
+ 	.globl  EXT(ResetHandlerData)
+ LEXT(ResetHandlerData)
+ 	.space  (rhdSize_NUM),0		// (filled with 0s)
++#if defined(BCM2837)
++	// rk3588: boot breadcrumbs of the cores that PSCI starts (see RK3588_TRACE_LINE). Next to ResetHandlerData on purpose:
++	// ArmCpu cleans that page to memory before every CPU_ON, so no stale dirty line can overwrite what a core stores here
++	// with its MMU off. Stores go through physical addresses only; the section is read-only once the kernel is up.
++	.align	6
++	.globl  EXT(rk3588_smp_trace)
++LEXT(rk3588_smp_trace)
++	.space  (8 * 64),0
++#endif
+ 	.text
+ 
+ 
+@@ -299,6 +405,10 @@
+ 
+ 	.align 2
+ start_cpu:
++#if defined(BCM2837)
++	RK3588_TRACE_LINE
++	RK3588_TRACE_STAGE 4
++#endif
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+ 	// This is done right away in reset vector for pre-KTRR devices
+ 	// Set low reset vector now that we are in the KTRR-free zone
+@@ -761,6 +871,15 @@
+ 	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
+ #endif /* HAS_APPLE_PAC */
+ 
++#if defined(BCM2837)
++	cbz		x21, Lrk3588_no_trace5				// the boot CPU (cold start) leaves no breadcrumbs
++	RK3588_TRACE_LINE
++	mrs		x17, SCTLR_EL1
++	str		x17, [x16, #48]
++	RK3588_TRACE_STAGE 5
++Lrk3588_no_trace5:
++#endif
++
+ 	// Enable caches, MMU, ROP and JOP
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0

@@ -1,0 +1,150 @@
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -632,6 +632,119 @@
+ 
+ /*****************************************************************************/
+ 
++/*
++ * 16550-compatible UART: Rockchip RK3588 UART2 (a Synopsys DesignWare APB UART)
++ * and anything else that behaves like an 8250/16550. Always built; it only
++ * registers itself when the ADT carries the node below.
++ *
++ * The node is an /arm-io child named "uart16550" (unixnu,adt-name in the SoC DTSI):
++ *   reg           2 x u64: offset from the SoC base of /arm-io, and size
++ *   reg-shift     optional u32: registers are (1 << reg-shift) bytes apart (default 2)
++ *   reg-io-width  optional u32: access width in bytes, 1 or 4 (default 4)
++ *
++ * The firmware has already programmed the line (8N1) and the baud rate, and the
++ * divisor depends on a clock this kernel knows nothing about, so init() leaves
++ * LCR/DLL/DLH alone. It only masks the UART's own interrupts: nothing in here
++ * services them, and an unmasked one would reach the GIC as a spurious SPI.
++ */
++#define SERIAL_16550_UART       ((serial_device_t)0x20)
++
++#define U16550_RBR_THR          0u      /* receive buffer / transmit holding */
++#define U16550_IER              1u      /* interrupt enable */
++#define U16550_LSR              5u      /* line status */
++#define U16550_LSR_DR           0x01u   /* receive data ready */
++#define U16550_LSR_THRE         0x20u   /* transmit holding register empty */
++#define U16550_TX_SPIN          20000u  /* reads of LSR we wait for THRE, per byte */
++
++static vm_offset_t u16550_base_vaddr = 0;
++static uint32_t u16550_reg_shift = 2;
++static uint32_t u16550_io_width = 4;
++static bool u16550_tx_wedged = false;
++
++static inline uint32_t
++u16550_read(unsigned int reg)
++{
++	vm_offset_t addr = u16550_base_vaddr + ((vm_offset_t)reg << u16550_reg_shift);
++
++	if (u16550_io_width == 1) {
++		return *(volatile uint8_t *)addr;
++	}
++	return *(volatile uint32_t *)addr;
++}
++
++static inline void
++u16550_write(unsigned int reg, uint32_t value)
++{
++	vm_offset_t addr = u16550_base_vaddr + ((vm_offset_t)reg << u16550_reg_shift);
++
++	if (u16550_io_width == 1) {
++		*(volatile uint8_t *)addr = (uint8_t)value;
++	} else {
++		*(volatile uint32_t *)addr = value;
++	}
++}
++
++static void
++u16550_init(void)
++{
++	u16550_write(U16550_IER, 0);
++}
++
++static unsigned int
++u16550_tr0(void)
++{
++	/*
++	 * Wait for THRE in here and always answer "ready". Reporting "not ready"
++	 * would make the caller WFE, and with interrupts masked this early nothing
++	 * guarantees the event stream is running to wake it up again. The wait is
++	 * short (one byte at the line rate) and bounded: if the UART never comes
++	 * ready it is declared wedged once and later bytes are dropped without a
++	 * delay instead of hanging every kprintf.
++	 */
++	if (!u16550_tx_wedged) {
++		for (uint32_t i = 0; i < U16550_TX_SPIN; i++) {
++			if (u16550_read(U16550_LSR) & U16550_LSR_THRE) {
++				return 1;
++			}
++		}
++		u16550_tx_wedged = true;
++	}
++	return 1;
++}
++
++static void
++u16550_td0(uint8_t c)
++{
++	u16550_write(U16550_RBR_THR, c);
++}
++
++static unsigned int
++u16550_rr0(void)
++{
++	uint32_t lsr = u16550_read(U16550_LSR);
++
++	/* All ones means the block is not answering (clock gated): no data. */
++	return (lsr != 0xFFFFFFFFu) && (lsr & U16550_LSR_DR);
++}
++
++static uint8_t
++u16550_rd0(void)
++{
++	return (uint8_t)u16550_read(U16550_RBR_THR);
++}
++
++SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) u16550_serial_functions =
++{
++	.init = u16550_init,
++	.transmit_ready = u16550_tr0,
++	.transmit_data = u16550_td0,
++	.receive_ready = u16550_rr0,
++	.receive_data = u16550_rd0,
++	.device = SERIAL_16550_UART
++};
++
++/*****************************************************************************/
++
+ #ifdef VMAPPLE_UART
+ 
+ static vm_offset_t vmapple_uart0_base_vaddr = 0;
+@@ -842,6 +955,27 @@
+ 	}
+ #endif /* PI3_UART */
+ 
++	/* 16550-compatible UART: the "uart16550" node of /arm-io, reg relative to the SoC base. */
++	if (SecureDTFindEntry("name", "uart16550", &entryP) == kSuccess &&
++	    SecureDTGetProperty(entryP, "reg", (void const **)&reg_prop, &prop_size) == kSuccess &&
++	    prop_size >= 2 * sizeof(uintptr_t)) {
++		prop_value = NULL;
++		if (SecureDTGetProperty(entryP, "reg-shift", (void const **)&prop_value, &prop_size) == kSuccess &&
++		    prop_size == sizeof(uint32_t) && *prop_value <= 3) {
++			u16550_reg_shift = *prop_value;
++		}
++		prop_value = NULL;
++		if (SecureDTGetProperty(entryP, "reg-io-width", (void const **)&prop_value, &prop_size) == kSuccess &&
++		    prop_size == sizeof(uint32_t) && (*prop_value == 1 || *prop_value == 4)) {
++			u16550_io_width = *prop_value;
++		}
++		prop_value = NULL;
++		u16550_base_vaddr = ml_io_map(soc_base + *reg_prop, (vm_size_t)*(reg_prop + 1));
++		if (u16550_base_vaddr != 0) {
++			register_serial_functions(&u16550_serial_functions);
++		}
++	}
++
+ #ifdef VMAPPLE_UART
+ 	if (SecureDTFindEntry("name", "uart0", &entryP) == kSuccess) {
+ 		SecureDTGetProperty(entryP, "reg", (void const **)&reg_prop, &prop_size);

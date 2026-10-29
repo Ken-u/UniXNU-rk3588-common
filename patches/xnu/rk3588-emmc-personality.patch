@@ -1,0 +1,25 @@
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -56,6 +56,22 @@
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+     "     'IOProbeScore'    = 0:32;"
+     "   },"
++    /*
++     * RK3588: the DesignWare MSHC eMMC host. Built in unconditionally; the archive
++     * is force-loaded through CONFIG_XNU_EXTRA_LD_ARCHIVES, and a kernel without it simply
++     * never finds the class (the personality then matches nothing). The nub comes from
++     * /arm-io/emmc in the device tree.
++     *
++     * It sits between the two original entries on purpose: the patches that add to the
++     * ends of this table check their context on every rebuild, and an entry appended
++     * after theirs would make them look unapplied.
++     */
++    "   {"
++    "     'IOClass'         = NativeEmmc;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'rockchip,rk3588-dwcmshc';"
++    "     'IOProbeScore'    = 1000:32;"
++    "   },"
+     "   {"
+     "     'IOClass'         = IOExclaveProxy;"
+     "     'IOProviderClass' = IOService;"

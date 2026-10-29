@@ -1,0 +1,13 @@
+# RK3588 XNU patches, applied after the ARM64 series and before the OS and device series.
+# 16550-compatible console (RK3588 UART2, Synopsys DesignWare APB UART) from the /arm-io node "uart16550"
+rk3588-pe-serial-16550.patch
+# Reset and restart through PSCI (nothing else implements IOPlatformExpert::haltRestart here)
+rk3588-psci-restart.patch
+# Secondary cores: PSCI starts them at EL2; drop to EL1 before XNU's reset vector
+rk3588-smp-el2.patch
+# EL0 may read CTR_EL0 (Mesa sizes its cache maintenance from it)
+rk3588-sctlr-uct.patch
+# Personality of the DesignWare MSHC eMMC host (Rk3588Emmc, class NativeEmmc)
+rk3588-emmc-personality.patch
+# The eMMC driver vouches for the owner's read-only root volume when the owner asks for it (emmc-root-trust=1)
+rk3588-root-trust.patch

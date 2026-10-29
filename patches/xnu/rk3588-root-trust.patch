@@ -1,0 +1,23 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1067,6 +1067,20 @@
+ #elif !XNU_TARGET_OS_OSX
+ 		/* Non MacOS */
+ 		require_rootauth = TRUE;
++		{
++			/*
++			 * RK3588 board: the root volume of a developer board is whatever its owner put on
++			 * the eMMC, and the IPSW's OS volume is not sealed, so FSIOC_KERNEL_ROOTAUTH
++			 * fails for it. NativeEmmc accepts the root only when the owner asked for
++			 * that (boot-arg emmc-root-trust=1), the mount is read-only and the root's
++			 * device is a volume inside the "OS" window it published itself.
++			 */
++			extern int native_emmc_root_trusted(dev_t);
++			if ((vfs_flags(vnode_mount(rootvnode)) & MNT_RDONLY) && native_emmc_root_trusted(rootdev)) {
++				printf("rootauth: skipped, the root is the owner's eMMC image (emmc-root-trust=1)\n");
++				require_rootauth = FALSE;
++			}
++		}
+ #endif // XNU_TARGET_OS_OSX && defined(__arm64__)
+ 
+ 		if (require_rootauth) {

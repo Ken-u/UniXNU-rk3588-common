@@ -1,0 +1,16 @@
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -528,7 +528,12 @@
+ #define SCTLR_DSSBS               (1ULL << 44)
+ 
+ 
+-#define SCTLR_EXTRA                               (0)
++/*
++ * RK3588: EL0 may read CTR_EL0 (UCT). Userland that sizes its cache maintenance from it (Mesa's util/cache_ops_aarch64.c, which PanVK flushes
++ * its CPU-side buffer writes with) otherwise dies with SIGILL on the first mrs; Linux sets the bit too. Both core types of the RK3588
++ * (A55, A76) have 64-byte cache lines, so the value is the same whichever core reads it.
++ */
++#define SCTLR_EXTRA                               (SCTLR_UCT_ENABLED)
+ 
+ 
+ #define SCTLR_RESERVED     ((3ULL << 28) | (1ULL << 20))
