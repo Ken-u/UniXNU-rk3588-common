@@ -5,6 +5,11 @@
 //
 // A node becomes a child of /arm-io in the Apple device tree only when it has `unixnu,adt-name` and is
 // enabled. Disabled nodes document hardware that a driver addresses by a fixed physical address.
+//
+// Do not give an exported node an `interrupts` property. The ADT gets `interrupt-parent` and the controller's
+// `phandle`, but XNU's IODeviceTreeSupport resolves an interrupt parent through `AAPL,phandle`, finds nothing and
+// dereferences NULL in IODTMapInterruptsSharing (kernel data abort during IOKit start, seen on the EVB10). The
+// drivers use fixed SPI numbers (eMMC 205, UART2 333) instead.
 
 / {
 	compatible = "rockchip,rk3588";
@@ -58,7 +63,7 @@
 			compatible = "rockchip,rk3588-dwcmshc", "rockchip,dwcmshc-sdhci";
 			unixnu,adt-name = "emmc";
 			reg = <0 0xfe2e0000 0 0x10000>;
-			interrupts = <0 205 4 0>;
+			// SPI 205: no `interrupts` here, see the note at the top
 			status = "disabled";
 		};
 
@@ -69,7 +74,7 @@
 			reg = <0 0xfeb50000 0 0x100>;
 			reg-shift = <2>;
 			reg-io-width = <4>;
-			interrupts = <0 333 4 0>;
+			// SPI 333: no `interrupts` here, see the note at the top
 			status = "disabled";
 		};
 
