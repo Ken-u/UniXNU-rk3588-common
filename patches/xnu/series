@@ -1,4 +1,10 @@
 # RK3588 XNU patches, applied after the ARM64 series and before the OS and device series.
+# Two UniXNU base patches are not in the ARM64 series although later patches quote their context:
+# native-smp-secondary sets MAX_CPUS 8 and the Affinity1 core numbering, and sheng-platform-power adds the
+# bsd_init.c block that the OS series' zzz-boot-progress.patch uses as context (CONFIG_XNU_SHENG_PMGR is off,
+# so the block compiles to nothing).
+arch:../../../patches/xnu/native-smp-secondary.patch
+arch:../../../patches/xnu/sheng-platform-power.patch
 # 16550-compatible console (RK3588 UART2, Synopsys DesignWare APB UART) from the /arm-io node "uart16550"
 rk3588-pe-serial-16550.patch
 # Reset and restart through PSCI (nothing else implements IOPlatformExpert::haltRestart here)
