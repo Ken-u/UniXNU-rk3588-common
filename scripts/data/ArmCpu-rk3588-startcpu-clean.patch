@@ -1,0 +1,117 @@
+--- a/ArmCpu.cpp
++++ b/ArmCpu.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: BSD-2-Clause-Patent
+ #include <IOKit/IOCPU.h>
+ #include <IOKit/IODeviceTreeSupport.h>
++#include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <libkern/c++/OSData.h>
+ #include <libkern/c++/OSSymbol.h>
+@@ -18,6 +19,11 @@
+ extern "C" void thread_deallocate (thread_t);
+ extern "C" thread_t current_thread (void);
+ extern "C" kern_return_t thread_terminate (thread_t);
++// What a core started by PSCI reads with its MMU and caches off, beyond the reset vector page (osfmk/arm64/start.s): the kernel table base it loads into
++// TTBR1_EL1 (cpu_ttep) and the TCR_EL1 value (sysreg_restore, first word). And the breadcrumbs the reset path leaves (rk3588-smp-el2.patch).
++extern "C" uint64_t cpu_ttep;
++extern "C" char sysreg_restore[];
++extern "C" volatile uint64_t rk3588_smp_trace[];
+ 
+ extern "C" {
+ volatile uint32_t armcpu_registered = 0;
+@@ -46,6 +52,7 @@
+ // System registers seen on each secondary core at initCPU entry: CurrentEL, SCTLR_EL1, TCR_EL1, MAIR_EL1 (low words), MIDR_EL1.
+ volatile uint32_t armcpu_smp_sys[8][5], armcpu_boot_sys[5];
+ volatile int32_t armcpu_smp_psci_rc[8];
++volatile uint32_t armcpu_core_mhz[8];   // each core's clock as it measured itself in initCPU: PMU cycle counter against the architected counter over 2 ms
+ }
+ 
+ #define ARMCPU_SMP_SLOTS 8
+@@ -138,6 +145,25 @@
+   return value;
+ }
+ 
++// This core's clock in MHz: the PMU cycle counter against the 24 MHz architected counter over 2 ms. Nothing in this port manages the CPU clocks, so
++// what the firmware left is what runs (boot-arg armcpu-mhz=0 turns the measurement off).
++static uint32_t measureMhz (void)
++{
++  unsigned enabled = 1;
++  PE_parse_boot_argn ("armcpu-mhz", &enabled, sizeof (enabled));
++  if (!enabled) { return 0; }
++  uint64_t freq, pmcr, c0, c1, t0, t1;
++  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
++  __asm__ volatile ("mrs %0, pmcr_el0" : "=r" (pmcr));
++  pmcr = (pmcr | 1) & ~8ULL;   // E = 1, D = 0: count every cycle
++  __asm__ volatile ("msr pmcr_el0, %0\n\tmsr pmcntenset_el0, %1\n\tisb" :: "r" (pmcr), "r" (1ULL << 31) : "memory");
++  t0 = counter ();
++  __asm__ volatile ("mrs %0, pmccntr_el0" : "=r" (c0));
++  do { t1 = counter (); } while (t1 - t0 < freq / 500);
++  __asm__ volatile ("mrs %0, pmccntr_el0" : "=r" (c1));
++  return static_cast<uint32_t> ((c1 - c0) * freq / (t1 - t0) / 1000000);
++}
++
+ static bool waitClear (uintptr_t base, unsigned offset, uint32_t mask)
+ {
+   uint64_t frequency;
+@@ -543,6 +569,7 @@
+     setCPUState (kIOCPUStateRunning);
+     armcpu_smp_step[logicalId] = 7;
+     armcpu_smp_running = armcpu_smp_running + 1;
++    armcpu_core_mhz[logicalId & 7] = measureMhz ();
+     // XNU clears SIGPdisabled for a core the first time that core takes an IPI, and cpu_signal() silently skips a core until then; Apple's
+     // CPU driver provokes it with a self-IPI from initCPU (osfmk/kern/machine.c, processor_up).
+     if (gSelfIpi) { signalCPU (this); }
+@@ -559,6 +586,7 @@
+   if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
+   enableCPUTimeBase (true);
+   setCPUState (kIOCPUStateRunning);
++  armcpu_core_mhz[logicalId & 7] = measureMhz ();
+   if (gSelfIpi) { signalCPU (this); }
+ }
+ 
+@@ -774,7 +802,24 @@
+   uintptr_t line = static_cast<uintptr_t> (4) << ((ctr >> 16) & 15);
+   uintptr_t address = reinterpret_cast<uintptr_t> (start) & ~(line - 1), end = reinterpret_cast<uintptr_t> (start) + length;
+   for (; address < end; address += line) { __asm__ volatile ("dc civac, %0" :: "r" (address) : "memory"); }
+-  __asm__ volatile ("dsb sy; isb" ::: "memory");
++  __asm__ volatile ("dsb sy\n\tisb" ::: "memory");
++}
++
++// A core that never arrives only stalls processor_start()'s helper thread, silently. This thread says so 5 s after CPU_ON, with the breadcrumbs the
++// core left in the reset path: stage 5 with a TTBR1/TCR of zero means it read stale memory with its MMU off (osfmk/arm64/start.s).
++static void smpWatch (void *argument, wait_result_t)
++{
++  const unsigned id = static_cast<unsigned> (reinterpret_cast<uintptr_t> (argument)) & 7;
++  IOSleep (5000);
++  if (armcpu_smp_step[id] >= 7) {
++    printf ("armcpu: cpu %u running, %u MHz\n", id, armcpu_core_mhz[id]);
++  } else {
++    volatile uint64_t *t = &rk3588_smp_trace[id * 16];
++    __asm__ volatile ("dc civac, %0\n\tdc civac, %1\n\tdsb sy" :: "r" (t), "r" (t + 8) : "memory");
++    printf ("armcpu: smp bring-up failed: cpu %u is at step %u after 5 s (running %u); reset path stage %u el %#llx/%#llx ttbr1 %#llx tcr %#llx ttbr0 %#llx\n",
++            id, armcpu_smp_step[id], armcpu_smp_running, static_cast<uint32_t> (t[0]), t[1], t[3], t[7], t[8], t[9]);
++  }
++  thread_terminate (current_thread ());
+ }
+ 
+ kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
+@@ -789,6 +834,18 @@
+   cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable
+   cleanToMemory (ResetHandlerData, 0x1000);
+   cleanToMemory (const_boot_args, 0x1000);
++  // The two variables the new core reads with its MMU off after that (common_start in start.s): the kernel table base (cpu_ttep) and TCR (sysreg_restore).
++  // XNU does not write them back: they sit in a read-only-late section next to kernel_pmap, which is read all the time, so the line can stay dirty in this
++  // core's caches for good and the new core would read what the loader left (zero) - every secondary then hangs right after it turns its MMU on
++  // (2026-10-29: perf1 and 9 of 157 earlier runs, "smp running 0"). armcpu-clean-reset-data=0 leaves them as they were.
++  unsigned cleanData = 1;
++  PE_parse_boot_argn ("armcpu-clean-reset-data", &cleanData, sizeof (cleanData));
++  if (cleanData) {
++    cleanToMemory (&cpu_ttep, sizeof (cpu_ttep));
++    cleanToMemory (sysreg_restore, 64);
++  }
++  thread_t watch;
++  if (kernel_thread_start (&smpWatch, reinterpret_cast<void *> (static_cast<uintptr_t> (logicalId)), &watch) == KERN_SUCCESS) { thread_deallocate (watch); }
+   armcpu_smp_step[logicalId] = 4;
+   int64_t result = psciCall (hvc, 0xc4000003ULL, affinity & 0xff00ffffffULL, entry, 0);
+   armcpu_smp_psci_rc[logicalId] = static_cast<int32_t> (result);

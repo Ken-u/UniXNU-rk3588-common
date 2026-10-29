@@ -1,16 +1,19 @@
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -90,6 +90,32 @@
+@@ -90,6 +90,35 @@
  #endif /* defined(KERNEL_INTEGRITY_KTRR) */
  .endmacro
  
 +#if defined(BCM2837)
 +/*
 + * rk3588: per-core boot breadcrumbs. A core that is still running with its MMU off cannot be inspected any other way, so
-+ * each stage of the reset path records itself in rk3588_smp_trace (physical memory, 64 bytes per core, indexed by MPIDR
++ * each stage of the reset path records itself in rk3588_smp_trace (physical memory, 128 bytes per core, indexed by MPIDR
 + * Affinity1 which is the core number on RK3588) for the boot CPU to read back:
 + *   [0] stage   [1] CurrentEL at entry   [2] MPIDR   [3] CurrentEL after the EL2 drop
-+ *   [4] cpu data PA   [5] reset handler   [6] SCTLR_EL1 just before the MMU is enabled   [7] unused
++ *   [4] cpu data PA   [5] reset handler   [6] SCTLR_EL1 just before the MMU is enabled
++ *   [7] TTBR1_EL1   [8] TCR_EL1   [9] TTBR0_EL1, as they stand then. TTBR1 and TCR come from cpu_ttep and sysreg_restore,
++ *   which this core reads with its MMU off, straight from DRAM: zero there means it read what the loader left, not what
++ *   the boot CPU wrote (the value is still dirty in the boot CPU's cache) and the core hangs when it enables the MMU.
 + * All stores happen with the MMU off (device ordering, straight to memory) and the area sits next to ResetHandlerData,
 + * which the boot CPU cleans to memory before every PSCI CPU_ON.
 + * RK3588_TRACE_LINE leaves the core's line in x16 and clobbers x17.
@@ -20,7 +23,7 @@
 +	ubfx	x16, x16, #8, #3
 +	adrp	x17, EXT(rk3588_smp_trace)@page
 +	add		x17, x17, EXT(rk3588_smp_trace)@pageoff
-+	add		x16, x17, x16, lsl #6
++	add		x16, x17, x16, lsl #7
 +.endmacro
 +
 +.macro RK3588_TRACE_STAGE
@@ -33,7 +36,7 @@
  /*
   * Checks the reset handler for global and CPU-specific reset-assist functions,
   * then jumps to the reset handler with boot args and cpu data. This is copied
-@@ -127,6 +153,71 @@
+@@ -127,6 +156,71 @@
  	.align	7
  	.globl EXT(reset_vector)
  LEXT(reset_vector)
@@ -105,7 +108,7 @@
  	// Preserve x0 for start_first_cpu, if called
  	// Unlock the core for debugging
  	msr		OSLAR_EL1, xzr
-@@ -170,6 +261,12 @@
+@@ -170,6 +264,12 @@
  	add		x20, x20, EXT(const_boot_args)@pageoff
  	ldr		x0, [x21, CPU_RESET_HANDLER]		// Call CPU reset handler
  	cbz		x0, Lskip_cpu_reset_handler
@@ -118,7 +121,7 @@
  
  	// Validate that our handler is one of the two expected handlers
  	adrp	x2, EXT(resume_idle_cpu)@page
-@@ -213,6 +310,15 @@
+@@ -213,6 +313,15 @@
  	.globl  EXT(ResetHandlerData)
  LEXT(ResetHandlerData)
  	.space  (rhdSize_NUM),0		// (filled with 0s)
@@ -129,12 +132,12 @@
 +	.align	6
 +	.globl  EXT(rk3588_smp_trace)
 +LEXT(rk3588_smp_trace)
-+	.space  (8 * 64),0
++	.space  (8 * 128),0
 +#endif
  	.text
  
  
-@@ -299,6 +405,10 @@
+@@ -299,6 +408,10 @@
  
  	.align 2
  start_cpu:
@@ -145,7 +148,7 @@
  #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
  	// This is done right away in reset vector for pre-KTRR devices
  	// Set low reset vector now that we are in the KTRR-free zone
-@@ -761,6 +871,15 @@
+@@ -761,6 +874,21 @@
  	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
  #endif /* HAS_APPLE_PAC */
  
@@ -154,6 +157,12 @@
 +	RK3588_TRACE_LINE
 +	mrs		x17, SCTLR_EL1
 +	str		x17, [x16, #48]
++	mrs		x17, TTBR1_EL1
++	str		x17, [x16, #56]
++	mrs		x17, TCR_EL1
++	str		x17, [x16, #64]
++	mrs		x17, TTBR0_EL1
++	str		x17, [x16, #72]
 +	RK3588_TRACE_STAGE 5
 +Lrk3588_no_trace5:
 +#endif

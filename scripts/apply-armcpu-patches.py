@@ -9,6 +9,13 @@ scripts/data/ArmCpu-rk3588-*.patch and this archive step applies them before `co
   ArmCpu-rk3588-sep-asm.patch   separates the instructions of inline assembly with "\\n\\t": the target is
                                 Mach-O and the Darwin assembler treats ';' as a comment, so
                                 "dsb ishst; msr icc_sgi1r_el1, %0; isb" assembled to a lone dsb
+  ArmCpu-rk3588-startcpu-clean.patch
+                                a secondary starts with its MMU and caches off and reads cpu_ttep and
+                                sysreg_restore (TTBR1, TCR) straight from DRAM: startCPU cleans them to memory
+                                first (boot argument armcpu-clean-reset-data=0 turns that off for diagnosis); a
+                                watchdog thread per started core reports a core that is not running after 5 s
+                                together with its reset-path breadcrumbs (rk3588-smp-el2.patch); every core
+                                reports its clock (armcpu-mhz=0 turns that off)
 
 The step restores drivers/ArmCpu of the tree (a link to the pinned checkout) to its pinned state first and then
 applies the patches, so a repeated run gives the same result. Run `git -C <checkout> checkout -- .` to get an
