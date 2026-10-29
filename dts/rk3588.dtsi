@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// Shared hardware description of the Rockchip RK3588 for UniXNU. Register addresses, interrupt numbers
+// and core numbering follow the Rockchip kernel 6.12 rk3588s.dtsi / rk3588-base.dtsi and the
+// edk2-rk3588 firmware (RK3588Base.dsc.inc); the board DTS enables CPUs and peripherals and supplies RAM.
+//
+// A node becomes a child of /arm-io in the Apple device tree only when it has `unixnu,adt-name` and is
+// enabled. Disabled nodes document hardware that a driver addresses by a fixed physical address.
+
+/ {
+	compatible = "rockchip,rk3588";
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&gic>;
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		// CNTFRQ_EL0 programmed by the firmware: 24 MHz
+		timebase-frequency = <24000000>;
+
+		// Affinity1 numbering: four Cortex-A55 (0x000..0x300), four Cortex-A76 (0x400..0x700).
+		// `reg` is the MPIDR affinity that ArmCpu matches against the core number.
+		cpu0: cpu@0 { device_type = "cpu"; compatible = "arm,cortex-a55"; reg = <0x000>; };
+		cpu1: cpu@100 { device_type = "cpu"; compatible = "arm,cortex-a55"; reg = <0x100>; };
+		cpu2: cpu@200 { device_type = "cpu"; compatible = "arm,cortex-a55"; reg = <0x200>; };
+		cpu3: cpu@300 { device_type = "cpu"; compatible = "arm,cortex-a55"; reg = <0x300>; };
+		cpu4: cpu@400 { device_type = "cpu"; compatible = "arm,cortex-a76"; reg = <0x400>; };
+		cpu5: cpu@500 { device_type = "cpu"; compatible = "arm,cortex-a76"; reg = <0x500>; };
+		cpu6: cpu@600 { device_type = "cpu"; compatible = "arm,cortex-a76"; reg = <0x600>; };
+		cpu7: cpu@700 { device_type = "cpu"; compatible = "arm,cortex-a76"; reg = <0x700>; };
+	};
+
+	// TF-A (BL31) runs at EL3; cores started by CPU_ON arrive at EL2 (see patches/xnu/rk3588-smp-el2.patch)
+	psci {
+		compatible = "arm,psci-1.0";
+		method = "smc";
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		// GIC-600: distributor and redistributors (128 KiB per core)
+		gic: interrupt-controller@fe600000 {
+			compatible = "arm,gic-v3";
+			unixnu,adt-name = "intc";
+			reg = <0 0xfe600000 0 0x10000>, <0 0xfe680000 0 0x100000>;
+			#interrupt-cells = <4>;
+			#address-cells = <0>;
+			interrupt-controller;
+			redistributor-stride = <0 0x20000>;
+		};
+
+		// Synopsys DesignWare MSHC (SDHCI register set); the firmware leaves the card in HS400, 8 bit, 200 MHz
+		emmc: mmc@fe2e0000 {
+			compatible = "rockchip,rk3588-dwcmshc", "rockchip,dwcmshc-sdhci";
+			unixnu,adt-name = "emmc";
+			reg = <0 0xfe2e0000 0 0x10000>;
+			interrupts = <0 205 4 0>;
+			status = "disabled";
+		};
+
+		// UART2, Synopsys DesignWare APB UART (16550 compatible), 1.5 Mbaud as set up by the firmware
+		uart2: serial@feb50000 {
+			compatible = "rockchip,rk3588-uart", "snps,dw-apb-uart";
+			unixnu,adt-name = "uart16550";
+			reg = <0 0xfeb50000 0 0x100>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			interrupts = <0 333 4 0>;
+			status = "disabled";
+		};
+
+		// Mali-G610 (Valhall CSF). The Mali driver addresses it by its fixed physical base, so it is not exported.
+		gpu: gpu@fb000000 {
+			compatible = "rockchip,rk3588-mali", "arm,mali-valhall-csf";
+			reg = <0 0xfb000000 0 0x200000>;
+			interrupts = <0 92 4 0>, <0 93 4 0>, <0 94 4 0>;
+			interrupt-names = "job", "mmu", "gpu";
+			status = "disabled";
+		};
+	};
+};

@@ -1,0 +1,10 @@
+schema_version = 2
+
+[soc]
+name = "rk3588"
+description = "Rockchip RK3588"
+source_repository = "https://github.com/edk2-porting/edk2-rk3588"
+source_revision = "be4d361435ef5727e72d0c52e2d457d7ae465c2d"
+
+[components]
+include = ["ArmCpu", "ArmDTPlatform"]

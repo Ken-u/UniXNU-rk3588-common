@@ -1,0 +1,7 @@
+# Generated or vendor inputs, never committed
+mali_csffw.bin
+mali_csffw.inc
+gpu_files.inc
+*.o
+*.a
+__pycache__/
