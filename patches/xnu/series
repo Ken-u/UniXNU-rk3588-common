@@ -11,6 +11,12 @@ rk3588-pe-serial-16550.patch
 rk3588-psci-restart.patch
 # Secondary cores: PSCI starts them at EL2; drop to EL1 before XNU's reset vector
 rk3588-smp-el2.patch
+# The boot CPU is the /cpus node whose reg is the booting core's MPIDR, not the first node (which the host tool marks "running"), so the device tree can
+# list the Cortex-A76 cores first and the scheduler, which takes the lowest-numbered idle core, prefers them
+rk3588-boot-cpu-mpidr.patch
+# The scheduler sees the four Cortex-A55 and four Cortex-A76 cores as one kind of core. sched-slowcpus=<mask of logical CPU numbers> (boot-arg, off by default)
+# keeps threads of the user-initiated and interactive QoS classes off the slow cores while a fast core is idle or can be preempted
+rk3588-slow-cores.patch
 # EL0 may read CTR_EL0 (Mesa sizes its cache maintenance from it)
 rk3588-sctlr-uct.patch
 # Personality of the DesignWare MSHC eMMC host (Rk3588Emmc, class NativeEmmc)

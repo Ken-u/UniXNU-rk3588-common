@@ -1,0 +1,43 @@
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -962,12 +962,40 @@
+ 	return TRUE;
+ }
+ 
++/*
++ * RK3588: the core the firmware enters the kernel on (a Cortex-A55, MPIDR affinity 0) is a fact of the hardware, but the ADT builder marks the first /cpus
++ * node "running". XNU numbers the CPUs in node order and its scheduler, which sees every core as one cluster of one type, gives work to the lowest-numbered
++ * idle core: the device tree lists the faster Cortex-A76 cores first, so the boot core is not the first node. The boot CPU is therefore the node whose reg
++ * is the MPIDR affinity of the core that parses the tree; only a tree with no node for this core keeps the meaning of the state property.
++ */
+ static boolean_t
+ ml_is_boot_cpu(const DTEntry entry)
+ {
++	static int boot_core_listed = -1;
++	const uint32_t boot_affinity = (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") & (MPIDR_AFF2_MASK | MPIDR_AFF1_MASK | MPIDR_AFF0_MASK));
+ 	void const *prop;
+ 	unsigned int propSize;
+ 
++	if (boot_core_listed < 0) {
++		DTEntry cpus, cpu;
++		OpaqueDTEntryIterator iter;
++
++		boot_core_listed = 0;
++		if (SecureDTLookupEntry(NULL, "/cpus", &cpus) == kSuccess && SecureDTInitEntryIterator(cpus, &iter) == kSuccess) {
++			while (kSuccess == SecureDTIterateEntries(&iter, &cpu)) {
++				if (SecureDTGetProperty(cpu, "reg", &prop, &propSize) == kSuccess && propSize == sizeof(uint32_t) &&
++				    *(uint32_t const *)prop == boot_affinity) {
++					boot_core_listed = 1;
++				}
++			}
++		}
++	}
++
++	if (boot_core_listed) {
++		return (SecureDTGetProperty(entry, "reg", &prop, &propSize) == kSuccess && propSize == sizeof(uint32_t) &&
++		       *(uint32_t const *)prop == boot_affinity) ? TRUE : FALSE;
++	}
++
+ 	if (SecureDTGetProperty(entry, "state", &prop, &propSize) != kSuccess) {
+ 		panic("unable to retrieve state for cpu");
+ 	}

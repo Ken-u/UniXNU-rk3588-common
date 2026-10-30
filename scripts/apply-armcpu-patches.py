@@ -4,6 +4,11 @@
 ArmCpu has no patch channel of its own (the XNU series patches XNU only), so the fixes live in
 scripts/data/ArmCpu-rk3588-*.patch and this archive step applies them before `component:ArmCpu` builds the driver.
 
+  ArmCpu-rk3588-boot-cpu-slot.patch
+                                the boot core need not be logical core 0 (the device tree may list other cores
+                                first: dts/rk3588.dtsi lists the Cortex-A76 cores first so the scheduler, which
+                                takes the lowest-numbered idle core, prefers them): the secondaries that queue
+                                before the boot core registers are finished from slot 0 on, not slot 1
   ArmCpu-rk3588-mmio-sgi.patch  boot argument armcpu-mmio-sgi=1: deliver an IPI by setting SGI 0 pending in the
                                 target core's redistributor frame (fallback, off by default)
   ArmCpu-rk3588-sep-asm.patch   separates the instructions of inline assembly with "\\n\\t": the target is

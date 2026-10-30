@@ -1,0 +1,119 @@
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5095,6 +5095,56 @@
+ }
+ 
+ /*
++ * RK3588: four Cortex-A76 and four Cortex-A55 cores, which this kernel's scheduler cannot tell apart (one cluster, one core type). sched-slowcpus is the mask
++ * of the logical CPU numbers of the slow ones (0: no core is special). A thread whose base priority is at least sched-slowpri (the interactive and
++ * user-initiated QoS classes: the render server's threads) is not sent to an idle slow core while an idle fast core exists, nor while a fast core is running
++ * something less important that it can preempt, and it does not return to a slow core just because it last ran there. When every fast core is busy with work
++ * of the same or higher importance it runs on a slow core as before: waiting for a fast core can cost more than the slower core does.
++ */
++TUNABLE(uint32_t, sched_slow_cpu_mask, "sched-slowcpus", 0);
++TUNABLE(int, sched_slow_min_pri, "sched-slowpri", 37);
++
++/* Is there a running fast core whose thread this one can preempt (the search in choose_processor preempts the lowest priority one)? */
++static bool
++choose_processor_fast_victim(processor_set_t pset, thread_t thread, uint64_t slow_cpus)
++{
++	uint64_t active_map = ((pset->cpu_state_map[PROCESSOR_RUNNING] | pset->cpu_state_map[PROCESSOR_DISPATCHING]) &
++	    pset->recommended_bitmask & ~pset->pending_AST_URGENT_cpu_mask & ~slow_cpus);
++
++	if (SCHED(priority_is_urgent)(thread->sched_pri) == FALSE) {
++		active_map &= ~pset->pending_AST_PREEMPT_cpu_mask;
++	}
++	for (int cpuid = lsb_first(active_map); cpuid >= 0; cpuid = lsb_next(active_map, cpuid)) {
++		processor_t candidate = processor_array[cpuid];
++		if (candidate->processor_primary == candidate && candidate->current_pri < thread->sched_pri) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/*
++ * What the placements above did, counted apart for the UI QoS class (base priority 46 and up) and the rest (down to sched-slowpri): [0] threads placed by the
++ * search, [1] on an idle fast core, [2] by preempting a fast core, [3] with no fast core to take: the slow core as before. sched-slowstat=N has the
++ * maintenance thread print the counters every N seconds (the default, 0, prints nothing).
++ */
++TUNABLE(uint32_t, sched_slow_stat_secs, "sched-slowstat", 0);
++static uint32_t sched_slow_stat[2][4];
++
++static void
++sched_slow_report(void)
++{
++	static uint32_t calls;
++
++	if (sched_slow_stat_secs == 0 || sched_slow_cpu_mask == 0 || (++calls % (8 * sched_slow_stat_secs)) != 0) {
++		return;
++	}
++	printf("evb10: slowcpu: UI class placed %u, idle fast core %u, preempted a fast core %u, no fast core %u; below: placed %u, idle fast core %u, preempted %u, none %u\n",
++	    sched_slow_stat[0][0], sched_slow_stat[0][1], sched_slow_stat[0][2], sched_slow_stat[0][3], sched_slow_stat[1][0], sched_slow_stat[1][1],
++	    sched_slow_stat[1][2], sched_slow_stat[1][3]);
++}
++
++/*
+  *	choose_processor:
+  *
+  *	Choose a processor for the thread, beginning at
+@@ -5126,6 +5176,12 @@
+ 		processor = processor->processor_primary;
+ 	}
+ 
++	/* The cores this thread keeps off while a faster one will do (sched_slow_cpu_mask) */
++	const uint64_t slow_cpus = (sched_slow_cpu_mask != 0 && thread->base_pri >= sched_slow_min_pri) ? (uint64_t)sched_slow_cpu_mask : 0;
++	if (slow_cpus != 0 && processor != PROCESSOR_NULL && bit_test(slow_cpus, processor->cpu_id)) {
++		processor = PROCESSOR_NULL;
++	}
++
+ 	/*
+ 	 * Only consult platform layer if pset is active, which
+ 	 * it may not be in some cases when a multi-set system
+@@ -5332,6 +5388,26 @@
+ 		 * Choose an idle processor, in pset traversal order
+ 		 */
+ 		uint64_t idle_primary_map = (pset->cpu_state_map[PROCESSOR_IDLE] & pset->primary_map & pset->recommended_bitmask);
++		bool slow_cpus_avoided = false;
++
++		if (slow_cpus != 0) {
++			const int ui = thread->base_pri >= 46 ? 0 : 1;
++
++			sched_slow_stat[ui][0]++;
++			if ((idle_primary_map & ~slow_cpus) != 0) {
++				/* an idle fast core exists: the idle slow ones are not candidates */
++				idle_primary_map &= ~slow_cpus;
++				sched_slow_stat[ui][1]++;
++			} else if (choose_processor_fast_victim(pset, thread, slow_cpus)) {
++				/* no fast core is idle, but one is running something less important: the search below preempts that one, not a slow core */
++				idle_primary_map = 0;
++				slow_cpus_avoided = true;
++				sched_slow_stat[ui][2]++;
++			} else {
++				sched_slow_stat[ui][3]++;
++			}
++		}
++
+ 		uint64_t preferred_idle_primary_map = idle_primary_map & pset->perfcontrol_cpu_preferred_bitmask;
+ 
+ 		/* there shouldn't be a pending AST if the processor is idle */
+@@ -5388,6 +5464,10 @@
+ 			active_map &= ~pset->pending_AST_PREEMPT_cpu_mask;
+ 		}
+ 
++		if (slow_cpus_avoided) {
++			active_map &= ~slow_cpus;
++		}
++
+ 		active_map = bit_ror64(active_map, (pset->last_chosen + 1));
+ 		for (int rotid = lsb_first(active_map); rotid >= 0; rotid = lsb_next(active_map, rotid)) {
+ 			cpuid = ((rotid + pset->last_chosen + 1) & 63);
+@@ -6947,6 +7027,8 @@
+ 	 */
+ 	sched_vm_group_maintenance();
+ 
++	sched_slow_report();
++
+ #if __arm64__
+ 	/* Check to see if the recommended cores failsafe is active */
+ 	sched_recommended_cores_maintenance();

@@ -1,0 +1,13 @@
+--- a/ArmCpu.cpp
++++ b/ArmCpu.cpp
+@@ -432,7 +432,9 @@
+ 
+ void ArmCpu::drainPending (void)
+ {
+-  for (unsigned id = 1; id < ARMCPU_SMP_SLOTS; id++) {
++  // Slot 0 is a secondary too when the device tree lists another core first (the boot core is then not logical core 0); the boot core's own slot
++  // is never filled, so there is nothing to skip.
++  for (unsigned id = 0; id < ARMCPU_SMP_SLOTS; id++) {
+     ArmCpu *cpu = __atomic_exchange_n (&gPending[id], static_cast<ArmCpu *> (nullptr), __ATOMIC_ACQ_REL);
+     if (cpu != nullptr) { cpu->finishSecondary (); }
+   }
