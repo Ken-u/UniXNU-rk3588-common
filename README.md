@@ -24,6 +24,7 @@ and [component catalog](https://unixnu.com/reference/components).
 | `patches/xnu/series` | Ordered XNU patches |
 | `scripts/apply-armcpu-patches.py` | Archive step: applies the ArmCpu fixes in `scripts/data/` |
 | `kits/` | Reserved for shared platform operations |
+| `tools/board/` | Host-side bring-up tools shared by RK3588 boards: serial capture with times, U-Boot console, USB helpers, reset controller. Not part of the kernel build; see its [README](tools/board/README.md) |
 
 ## XNU patches
 

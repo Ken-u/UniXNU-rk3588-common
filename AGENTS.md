@@ -26,6 +26,8 @@ Rules specific to this repository:
   fresh XNU clone.
 - Do not use observations from other Rockchip SoCs to decide RK3588 behavior.
 - Keep addresses, hostnames, accounts, and local paths out of this repository.
+- `tools/board/` is host-side tooling shared by boards. Keep any board's USB ids, load addresses, boot flow, and
+  payload out of it, and run `python3 tools/board/selftest.py` after editing it.
 
 Report commands, results, required local inputs, and hardware checkpoints.
 Write concise English describing current behavior.
