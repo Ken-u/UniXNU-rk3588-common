@@ -23,3 +23,5 @@ rk3588-sctlr-uct.patch
 rk3588-emmc-personality.patch
 # The eMMC driver vouches for the owner's read-only root volume when the owner asks for it (emmc-root-trust=1)
 rk3588-root-trust.patch
+# Idle time of a CPU for the frequency governor in scripts/data/Rk3588Dvfs (a kernel extension cannot see struct processor)
+rk3588-cpu-idle.patch

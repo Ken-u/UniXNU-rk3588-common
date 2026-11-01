@@ -1,0 +1,29 @@
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -1714,3 +1714,26 @@
+ }
+ 
+ #endif /* defined(__arm64__) */
++
++/*
++ * RK3588 frequency management (Rk3588Dvfs) is a kernel extension that cannot see struct processor: this is a CPU's idle time so far in mach absolute time
++ * units (recount brings it up to now while the CPU idles), which the governor turns into a busy share per window. ~0 for a CPU number that has no
++ * processor or whose processor is not running (cpumask leaves it off).
++ */
++extern int ml_get_max_cpu_number(void);
++uint64_t rk3588_cpu_idle_mach(int cpu);
++uint64_t
++rk3588_cpu_idle_mach(int cpu)
++{
++	if (cpu < 0 || cpu > ml_get_max_cpu_number()) {
++		return ~0ULL;
++	}
++	processor_t p = cpu_to_processor(cpu);
++	if (p == PROCESSOR_NULL || p->state == PROCESSOR_OFF_LINE || p->state == PROCESSOR_START) {
++		return ~0ULL;
++	}
++	struct recount_usage usage = { 0 };
++	uint64_t idle = 0;
++	recount_processor_usage(&p->pr_recount, &usage, &idle);
++	return idle;
++}
