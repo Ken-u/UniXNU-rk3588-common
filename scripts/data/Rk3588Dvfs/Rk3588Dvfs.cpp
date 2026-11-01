@@ -127,6 +127,26 @@ void reportPmics() {
 
 // ---- the sweep (mode 2) ------------------------------------------------------------------------------------------------------------
 
+// Binds this thread to `cpu` and waits until it runs there (the bind takes effect when the thread is next scheduled, and an idle core can take a
+// moment to answer the wake-up): false when the core is not there or the thread did not arrive. Pair with unbind().
+bool bindTo(int cpu) {
+  if (cpu < 0 || cpu > int(ml_get_max_cpu_number())) return false;   // a core the boot arguments (cpumask) leave off
+  struct processor *target = cpu_to_processor(cpu);
+  if (!target) return false;
+  thread_bind(target);
+  for (unsigned tries = 0; tries < 20; ++tries) {
+    thread_block(THREAD_CONTINUE_NULL);
+    if (int(cpu_number()) == cpu) return true;
+    IOSleep(1);
+  }
+  return false;
+}
+
+void unbind() {
+  thread_bind(nullptr);
+  thread_block(THREAD_CONTINUE_NULL);
+}
+
 // A chain of dependent adds: 8 per iteration, one cycle each on the Cortex-A55 and the Cortex-A76, the loop control runs beside it.
 void spin(uint64_t iterations) {
   uint64_t x = 0;
@@ -149,13 +169,8 @@ void spin(uint64_t iterations) {
 
 // The clock `cpu` really runs at, in MHz: the best of five runs on a thread bound to it (a preempted run only looks slower).
 unsigned measureMhz(int cpu) {
-  if (cpu < 0 || cpu > int(ml_get_max_cpu_number())) return 0;   // a core the boot arguments (cpumask) leave off
-  struct processor *target = cpu_to_processor(cpu);
-  if (!target) return 0;
-  thread_bind(target);
-  thread_block(THREAD_CONTINUE_NULL);
   unsigned best = 0;
-  if (int(cpu_number()) == cpu) {
+  if (bindTo(cpu)) {
     constexpr uint64_t kIterations = 1500000;
     uint64_t shortest = ~0ULL;
     for (unsigned run = 0; run < 5; ++run) {
@@ -168,8 +183,7 @@ unsigned measureMhz(int cpu) {
     absolutetime_to_nanoseconds(shortest, &ns);
     if (ns) best = unsigned(kIterations * 8 * 1000ULL / ns);
   }
-  thread_bind(nullptr);
-  thread_block(THREAD_CONTINUE_NULL);
+  unbind();
   return best;
 }
 
@@ -267,22 +281,14 @@ uint64_t *chainMake(size_t bytes) {
   return buffer;
 }
 
-uint64_t gChainSink;
+// A volatile sink: nothing reads it, and a plain global written once after the loop lets the compiler delete the whole chain of loads (the first version of
+// this probe measured 0 ns for exactly that reason, and printing the result inside the function hid it).
+volatile uint64_t gChainSink;
 
 // The time of one load of the chain on `cpu`, in tenths of a nanosecond (the best of three runs).
 unsigned chainTenthNs(int cpu, const uint64_t *buffer, uint64_t loads) {
-  static unsigned traced;
-  if (!buffer || cpu < 0 || cpu > int(ml_get_max_cpu_number())) {
-    if (traced++ < 3) printf("rk3588-dvfs: chain: refused (buffer %p cpu %d max %u)\n", static_cast<const void *>(buffer), cpu, unsigned(ml_get_max_cpu_number()));
-    return 0;
-  }
-  struct processor *target = cpu_to_processor(cpu);
-  if (!target) return 0;
-  thread_bind(target);
-  thread_block(THREAD_CONTINUE_NULL);
   unsigned best = 0;
-  if (traced++ < 3) printf("rk3588-dvfs: chain: bound to cpu%d, running on cpu%d, loads %llu\n", cpu, int(cpu_number()), loads);
-  if (int(cpu_number()) == cpu) {
+  if (buffer && bindTo(cpu)) {
     uint64_t shortest = ~0ULL, at = 0;
     for (unsigned run = 0; run < 3; ++run) {
       const uint64_t t0 = mach_absolute_time();
@@ -294,13 +300,8 @@ unsigned chainTenthNs(int cpu, const uint64_t *buffer, uint64_t loads) {
     uint64_t ns = 0;
     absolutetime_to_nanoseconds(shortest, &ns);
     best = unsigned(ns * 10 / loads);
-    if (traced < 6) {
-      ++traced;
-      printf("rk3588-dvfs: chain: %llu ticks, %llu ns, at %llu\n", shortest, ns, at);
-    }
   }
-  thread_bind(nullptr);
-  thread_block(THREAD_CONTINUE_NULL);
+  unbind();
   return best;
 }
 
@@ -319,9 +320,9 @@ void dsuProbe() {
     uint64_t dsu = 0;
     rk3588_scmi_clock_rate_get(kRk3588ScmiClkDsu, &dsu);
     IODelay(300);
-    printf("rk3588-dvfs: dsu: cortex-a55 %u MHz, dsu %u MHz: cpu0 load from the l3 %u.%u ns, from memory %u.%u ns\n", little->level[i].mhz, mhz(dsu),
-           chainTenthNs(0, l3, 1u << 20) / 10, chainTenthNs(0, l3, 1u << 20) % 10, chainTenthNs(0, memory, 1u << 19) / 10,
-           chainTenthNs(0, memory, 1u << 19) % 10);
+    const unsigned fromL3 = chainTenthNs(0, l3, 1u << 20), fromMemory = chainTenthNs(0, memory, 1u << 19);
+    printf("rk3588-dvfs: dsu: cortex-a55 %u MHz, dsu %u MHz: cpu0 load from the l3 %u.%u ns, from memory %u.%u ns\n", little->level[i].mhz, mhz(dsu), fromL3 / 10,
+           fromL3 % 10, fromMemory / 10, fromMemory % 10);
   }
   // does the DSU take a rate of its own? with the cortex-a55 cores at their lowest point
   levelSet(*little, 0);
