@@ -16,6 +16,11 @@
 //                            6: the governor: every 16 ms each cluster's busy share (from the CPUs' idle time) picks its operating point, rate and
 //                               voltage together (Rk3588Governor.cpp)
 //                            7: the governor's windows, busy shares and temperatures without any change of rate or voltage (the baseline)
+//                               (6 and 7 also run the GPU governor, Rk3588Gpu.cpp: rk3588-gpu=0 leaves the GPU out, rk3588-gpu-min / -max / -boost-ms)
+//                            8: the GPU's clock (Rk3588Gpu.cpp): every rate of the clock service in turn with the GPU rail raised, what it does to the
+//                               clock registers and what the GPU's cycle counter measures; ends with clock and rail as they were
+//                            9: the GPU's busy share (GPU_STATUS) in 50 ms windows
+//                           10: the GPU's clock against its voltage: for each PVTPLL setting the rail walks down from 850 mV and the cycle counter measures
 //            rk3588-dvfs-min=MHz        the governor's lowest point for the Cortex-A76 and Cortex-A55 clusters (default 0: the lowest the tables have)
 //            rk3588-dvfs-boost-ms=N     how long a touch holds the Cortex-A76 clusters at their top point (default 300, 0 = no boost)
 //            rk3588-dvfs-report=N  seconds between reports of mode 1 (default 10, 1..600), three reports in all
@@ -29,6 +34,7 @@
 #include "Rk3588Domain.h"
 #include "Rk3588Dvfs.h"
 #include "Rk3588Governor.h"
+#include "Rk3588Gpu.h"
 #include "Rk3588Pmic.h"
 #include "Rk3588Thermal.h"
 #include "Rk3588Scmi.h"
@@ -354,6 +360,32 @@ void dsuProbe() {
   IOFree(memory, 24u << 20);
 }
 
+// The GPU governor has a thread of its own: it samples the GPU about every millisecond, the CPU governor's windows are 16 ms.
+const Rk3588DvfsRail *gGpuRail;
+bool gGpuApply;
+
+void gpuGovernorMain(void *, wait_result_t) {
+  if (rk3588::gpuAttach(60000)) rk3588::gpuGovernorRun(*gGpuRail, gGpuApply);   // does not return
+  else printf("rk3588-dvfs: gpu governor: the Mali driver has not brought the GPU up\n");
+  thread_terminate(current_thread());
+}
+
+void startGpuGovernor(bool apply) {
+  unsigned enabled = 1;
+  PE_parse_boot_argn("rk3588-gpu", &enabled, sizeof enabled);
+  for (unsigned i = 0; i < rk3588_dvfs_rail_count; ++i)
+    if (rk3588_dvfs_rails[i].clock == kRk3588ScmiClkGpu) gGpuRail = &rk3588_dvfs_rails[i];
+  if (!enabled || !gGpuRail) return;
+  gGpuApply = apply;
+  thread_t t = nullptr;
+  if (kernel_thread_start(gpuGovernorMain, nullptr, &t) == KERN_SUCCESS) {
+    thread_set_thread_name(t, "rk3588-gpu");
+    thread_deallocate(t);
+  } else {
+    printf("rk3588-dvfs: no thread for the gpu governor\n");
+  }
+}
+
 void workerMain(void *, wait_result_t) {
   IOSleep(3000);
   if (rk3588_scmi_init()) {
@@ -381,7 +413,19 @@ void workerMain(void *, wait_result_t) {
     }
     if (gMode == 4) voltageSweep();
     if (gMode == 5) dsuProbe();
-    if (gMode == 6 || gMode == 7) rk3588::governorRun(gDomain, gDomains, gMode == 6);   // does not return
+    if (gMode == 6 || gMode == 7) {
+      startGpuGovernor(gMode == 6);
+      rk3588::governorRun(gDomain, gDomains, gMode == 6);   // does not return
+    }
+    if (gMode >= 8 && gMode <= 10) {
+      const Rk3588DvfsRail *gpuRail = nullptr;
+      for (unsigned i = 0; i < rk3588_dvfs_rail_count; ++i)
+        if (rk3588_dvfs_rails[i].clock == kRk3588ScmiClkGpu) gpuRail = &rk3588_dvfs_rails[i];
+      if (!gpuRail || !rk3588::gpuAttach(120000)) printf("rk3588-dvfs: gpu: no rail in the board's table (%p) or the Mali driver has not brought the GPU up\n", static_cast<const void *>(gpuRail));
+      else if (gMode == 8) rk3588::gpuSweep(*gpuRail);
+      else if (gMode == 10) rk3588::gpuVoltageSweep(*gpuRail);
+      else rk3588::gpuWatch();   // does not return
+    }
   }
   thread_terminate(current_thread());
 }
