@@ -60,8 +60,10 @@ the contract are in `Rk3588Dvfs.h`), and calls `rk3588_dvfs_start()` from a prob
 | `Rk3588Scmi` | The firmware's clock service: SCMI over SMC (smc-id `0x82000010`, shared memory `0x10f000`). Clock ids: CPUL 0, DSU 1, CPUB01 2, CPUB23 3, DDR 4, GPU 5, NPU 6 |
 | `Rk3588Pmic` | Polled drivers for the regulators of the reference design: RK806 on SPI2 (the Cortex-A55 rail is its DCDC2) and RK8602/RK8603 on I2C (the Cortex-A76 rails), reading the firmware's setup and leaving it in place |
 | `Rk3588Domain` | The operating points (voltage per rate) of the Cortex-A55 and Cortex-A76 clusters, and the change from one to another: voltage first when going up, clock first when going down |
-| `Rk3588Governor` | The CPU governor (below) |
-| `Rk3588Dvfs` | Boot arguments, and the staged probes used to bring it up (modes 1 to 5) |
+| `Rk3588Governor` | The CPU governor (below), including the over-temperature limit |
+| `Rk3588Thermal` | The seven TSADC sensors (`0xfec00000`), polled; brings the sampling up when the firmware left it off |
+| `Rk3588Gpu` | The Mali-G610's clock and activity: what the GPU runs at (its cycle counter), a busy share from `GPU_STATUS`, and the GPU governor (below) |
+| `Rk3588Dvfs` | Boot arguments, and the staged probes used to bring it up (modes 1 to 5 and 8 to 10) |
 
 Why the voltage is part of it: above 600 MHz the firmware clocks the cores from a PVTPLL, a ring oscillator whose speed follows the supply, and the
 rate the service reports is only the oscillator's setting. At the 1.0 V the firmware leaves on the Cortex-A76 rails every setting from 1608 MHz up
@@ -74,13 +76,28 @@ the Cortex-A55 rail. A load from the L3 takes 18 ns with the DSU at 1800 MHz and
 the DSU at three quarters of the faster Cortex-A76 cluster's rate.
 
 Boot arguments: `rk3588-dvfs=N` (0 off; 1 report the firmware's clocks; 2 and 3 sweep the rates and probe the regulators read-only; 4 sweep the operating
-points with their voltages; 5 measure the DSU; **6 run the governor**), `rk3588-dvfs-min=MHz`, `rk3588-dvfs-boost-ms=N`, `rk3588-dvfs-report=N`.
+points with their voltages; 5 measure the DSU; **6 run the governors**; 7 the same windows and temperatures without any change, the baseline; 8 sweep the GPU
+clock service's rates; 9 watch the GPU's busy share; 10 sweep the GPU's voltage), `rk3588-dvfs-min=MHz`, `rk3588-dvfs-boost-ms=N`, `rk3588-dvfs-tmax=C`,
+`rk3588-dvfs-report=N`, `rk3588-gpu=0`, `rk3588-gpu-min=MHz`, `rk3588-gpu-max=MHz`, `rk3588-gpu-boost-ms=N`.
 
-The governor (mode 6) looks at each cluster every 16 ms: the lowest point at or above 1.25 x busy x the current rate, the top point from 90 % busy, up at
+The CPU governor (mode 6) looks at each cluster every 16 ms: the lowest point at or above 1.25 x busy x the current rate, the top point from 90 % busy, up at
 once and down after four windows that asked for less; the Cortex-A76 clusters stay at or above half their top rate while there is work and go to the
-top for `rk3588-dvfs-boost-ms` when the board's activity counter moves (a touch). It prints each cluster's changes, mean rate, busy share, voltage and
-the time at each point every ten seconds. A cluster whose clock service or regulator fails five times is put back at its top point and left alone.
-Not done: thermal limits, the GPU and memory clocks (clock ids 5 and 4; the Mali driver sets its own), and an idle state that powers a cluster down.
+top for `rk3588-dvfs-boost-ms` (default 300) when the board's activity counter moves (a touch). Every eight windows it reads the sensors (`Rk3588Thermal`):
+at or above `rk3588-dvfs-tmax` (default 85 C, 0 = off) the highest point every cluster and the GPU may use goes down one step, and up again 2 C below. It
+prints each cluster's changes, mean rate, busy share, voltage and time at each point every ten seconds, with the mean temperature and a model of the cores'
+dynamic power (the vendor device tree's `dynamic-power-coefficient`, P = C f V^2 per busy core, against the same work at the top points). A cluster whose
+clock service or regulator fails five times is put back at its top point and left alone. The board has no power meter and the temperature sensors resolve
+0.93 C a step, so the power figure is a model, not a measurement.
+
+The GPU is not a PVTPLL clock only: the clock service puts the GPU on a PVTPLL for the settings 300 to 900 MHz (bit 14 of `CLKSEL_CON(158)`; the 800 and 900
+settings share one ring and differ by the supply only) and on GPLL / 6 for 200 MHz. As with the CPU the ring follows the supply: the cycle counter measures
+the setting's nominal rate at the vendor's voltage for it (300 at 675 mV 310 MHz, 600 at 675 mV 598, 700 at 700 mV 719, 800 at 750 mV 852, 900 at 800 mV 957),
+about 2.1 to 2.3 MHz per millivolt, and a lower voltage is slower, not unsafe. The service ignores a request for 1000 MHz. The Mali driver sets CPLL / 2 (750 MHz)
+itself and never goes through the service. The GPU governor (a thread of its own, started with mode 6) samples `GPU_STATUS` about every millisecond (every 8 ms
+after a second without work) and every 25 ms takes the top point at 40 % busy or more, otherwise the lowest that would keep the GPU about 30 % busy, up
+at once and down after three windows; a touch holds it at the top for `rk3588-gpu-boost-ms` (default 200); `rk3588-gpu-max` (default 800) caps the setting. Voltage
+first on the way up, last on the way down, from the vendor's table (rk3588s.dtsi `gpu_opp_table`, typical die).
+Not done: the DDR clock (clock id 4: the service has no rate list for it), and an idle state that powers a cluster down.
 
 ## Core order
 
