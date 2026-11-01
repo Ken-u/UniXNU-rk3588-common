@@ -15,8 +15,9 @@
 //                               the DSU takes a rate of its own
 //                            6: the governor: every 16 ms each cluster's busy share (from the CPUs' idle time) picks its operating point, rate and
 //                               voltage together (Rk3588Governor.cpp)
+//                            7: the governor's windows, busy shares and temperatures without any change of rate or voltage (the baseline)
 //            rk3588-dvfs-min=MHz        the governor's lowest point for the Cortex-A76 and Cortex-A55 clusters (default 0: the lowest the tables have)
-//            rk3588-dvfs-boost-ms=N     how long a touch holds the Cortex-A76 clusters at their top point (default 1000, 0 = no boost)
+//            rk3588-dvfs-boost-ms=N     how long a touch holds the Cortex-A76 clusters at their top point (default 300, 0 = no boost)
 //            rk3588-dvfs-report=N  seconds between reports of mode 1 (default 10, 1..600), three reports in all
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
@@ -29,6 +30,7 @@
 #include "Rk3588Dvfs.h"
 #include "Rk3588Governor.h"
 #include "Rk3588Pmic.h"
+#include "Rk3588Thermal.h"
 #include "Rk3588Scmi.h"
 
 // (kern/thread.h is not included: it changes how IOLib.h's typed allocators compile under -Werror)
@@ -69,6 +71,19 @@ void reportIdentity() {
   result = rk3588_scmi_clock_version(&version);
   const int counted = rk3588_scmi_clock_count(&clocks);
   printf("rk3588-dvfs: scmi clock protocol: version 0x%x (%d) clocks %u (%d)\n", version, result, clocks, counted);
+}
+
+// The seven sensors, in degrees Celsius with a tenth.
+void reportTemperatures(const char *when) {
+  static const char *const kNames[rk3588::kThermalChannels] = {"soc", "big0", "big1", "little", "center", "gpu", "npu"};
+  char line[160] = {};
+  unsigned used = 0;
+  for (unsigned c = 0; c < rk3588::kThermalChannels && used + 16 < sizeof line; ++c) {
+    int milli = 0;
+    if (rk3588::thermalRead(c, &milli)) used += unsigned(snprintf(line + used, sizeof line - used, " %s ?", kNames[c]));
+    else used += unsigned(snprintf(line + used, sizeof line - used, " %s %d.%d", kNames[c], milli / 1000, (milli < 0 ? -milli : milli) % 1000 / 100));
+  }
+  printf("rk3588-dvfs: thermal: %s:%s C\n", when, line);
 }
 
 // One line per clock: name, state, rate.
@@ -348,6 +363,9 @@ void workerMain(void *, wait_result_t) {
   }
   reportIdentity();
   reportRates();
+  const int thermal = rk3588::thermalInit();
+  printf("rk3588-dvfs: thermal: init %d\n", thermal);
+  reportTemperatures("start");
   const unsigned reports = gMode >= 2 ? 1 : 3;
   for (unsigned i = 0; i < reports; ++i) {
     reportClocks(i ? "again" : "start");
@@ -363,7 +381,7 @@ void workerMain(void *, wait_result_t) {
     }
     if (gMode == 4) voltageSweep();
     if (gMode == 5) dsuProbe();
-    if (gMode == 6) rk3588::governorRun(gDomain, gDomains);   // does not return
+    if (gMode == 6 || gMode == 7) rk3588::governorRun(gDomain, gDomains, gMode == 6);   // does not return
   }
   thread_terminate(current_thread());
 }
