@@ -124,20 +124,20 @@ def test_serial_capture(tmp):
     line = FakeLine()
     raw, ts = os.path.join(tmp, "d.raw"), os.path.join(tmp, "d.ts")
     p = subprocess.Popen([sys.executable, os.path.join(HERE, "serial-capture.py"),
-                          "--send", "menu: shown", "up,up,wait:0.5,enter,text:ab",
+                          "--send", "menu: shown", "up,up,wait:0.5,enter,text:ab,ctrl-c",
                           "--send", "NEVER", "esc", line.path, "5", raw, ts])
     time.sleep(0.4)
     line.say(b"firmware\r\nUNIXNU: menu: shown 5 entries\r\n")
-    time.sleep(2.5)  # the last key goes out 0.3 + 0.3 + (0.5 + 0.3) + 0.3 s after the line
+    time.sleep(2.9)  # the last key goes out 0.3 + 0.3 + (0.5 + 0.3) + 0.3 + 0.3 s after the line
     typed = line.received
     line.say(b"UNIXNU: menu: shown 5 entries\r\n")  # the menu prints the line twice: the keys go out once
     p.wait(timeout=10)
     text = open(ts, encoding="utf-8").read()
-    check("capture: --send types the keys after the matching line", typed == b"\x1b[A\x1b[A\rab", repr(typed))
+    check("capture: --send types the keys after the matching line", typed == b"\x1b[A\x1b[A\rab\x03", repr(typed))
     check("capture: --send types once, a later match and a rule that never matches add nothing",
-          line.received == b"\x1b[A\x1b[A\rab", repr(line.received))
+          line.received == b"\x1b[A\x1b[A\rab\x03", repr(line.received))
     check("capture: --send is noted in TS and the bytes read are still in RAW",
-          "typing up,up,wait:0.5,enter,text:ab" in text and b"menu: shown" in open(raw, "rb").read(), text)
+          "typing up,up,wait:0.5,enter,text:ab,ctrl-c" in text and b"menu: shown" in open(raw, "rb").read(), text)
     line.close()
 
     line = FakeLine()

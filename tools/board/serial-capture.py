@@ -25,10 +25,15 @@ with a trailing " ⏎"; the bytes that follow start a new line with their own ti
                         the rest of SECS.
 --send REGEX KEYS       May be repeated. Type KEYS on the line, once, after the first complete line that matches
                         REGEX. KEYS are separated by commas: up, down, left, right, enter, esc, space, tab,
-                        text:ANYTHING, wait:SECONDS; the keys follow each other 0.3 s apart. The same process
+                        ctrl-c, text:ANYTHING, wait:SECONDS; the keys follow each other 0.3 s apart. The same process
                         reads and writes, so the answer to the keys is in RAW and TS (a second reader would
                         take bytes away). For a boot menu with a countdown:
                         --send 'menu: shown' up,up,wait:1,enter
+                        To stop U-Boot's autoboot (it counts on a line that is not finished until the countdown
+                        ends, so match the banner before it and type Ctrl+C for the whole countdown), and end the
+                        run at the prompt:
+                        --send 'U-Boot v' ctrl-c,ctrl-c,ctrl-c,ctrl-c,ctrl-c,ctrl-c,ctrl-c,ctrl-c,ctrl-c,ctrl-c
+                        --stop '<INTERRUPT>' 1 'at the U-Boot prompt'
                         The device is then opened for writing as well; without --send nothing is ever written.
 """
 import argparse
@@ -40,7 +45,7 @@ import sys
 import time
 
 KEY_BYTES = {"up": b"\x1b[A", "down": b"\x1b[B", "right": b"\x1b[C", "left": b"\x1b[D", "enter": b"\r", "esc": b"\x1b",
-             "space": b" ", "tab": b"\t"}
+             "space": b" ", "tab": b"\t", "ctrl-c": b"\x03"}
 KEY_GAP = 0.3
 
 
@@ -57,7 +62,7 @@ def parse_keys(spec):
             out.append((KEY_GAP + extra, KEY_BYTES[token]))
             extra = 0.0
         else:
-            raise SystemExit("--send: unknown key %r (up down left right enter esc space tab text:X wait:N)" % token)
+            raise SystemExit("--send: unknown key %r (up down left right enter esc space tab ctrl-c text:X wait:N)" % token)
     return out
 
 

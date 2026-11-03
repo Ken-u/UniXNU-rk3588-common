@@ -7,7 +7,7 @@ repository of that board ([`uefi-evb10`](https://github.com/Ken-u/uefi-evb10) is
 
 | File | Purpose |
 | --- | --- |
-| `serial-capture.py` | One reader on the serial line. Writes the bytes as they came and a copy with the elapsed seconds in front of each line. `--stop REGEX SECS WHY` ends a run early once a known failure has been printed; `--send REGEX KEYS` types keys once after a matching line (to pick a boot menu entry through the same reader, e.g. `--send 'menu: shown' up,up,wait:1,enter`) |
+| `serial-capture.py` | One reader on the serial line. Writes the bytes as they came and a copy with the elapsed seconds in front of each line. `--stop REGEX SECS WHY` ends a run early once a known failure has been printed; `--send REGEX KEYS` types keys once after a matching line (to pick a boot menu entry through the same reader, e.g. `--send 'menu: shown' up,up,wait:1,enter`; `ctrl-c` is a key too, to stop U-Boot's autoboot) |
 | `uboot-cmd.py` | Sends commands to the U-Boot console and prints the answer up to the next `=> ` |
 | `usb-lib.sh` | Sourced by shell tools: `has_usb`, `usb_ids`, `usb_stable` (the ids come from sysfs, not lsusb), and `uboot_grab_cli` (interrupt autoboot and wait for the prompt) |
 | `hw-reset.sh` | Presses the board's RESET / RECOVERY / MASKROM keys through an ESP32-S3 controller, locally or through ssh. One attempt, no retry |
