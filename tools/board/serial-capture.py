@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Serial capture: the bytes as they came, plus a copy with the elapsed seconds in front of each line.
 
-    serial-capture.py [--stop REGEX SECS WHY]... DEV SECS RAW TS
+    serial-capture.py [--stop REGEX SECS WHY]... [--send REGEX KEYS]... DEV SECS RAW TS
 
 Equivalent to `timeout SECS cat DEV > RAW` (one reader; the line settings are the caller's:
 `stty -F DEV <baud> raw -echo` first), and it writes TS besides:
@@ -19,6 +19,13 @@ with a trailing " ⏎"; the bytes that follow start a new line with their own ti
                         (the first rule that matches wins) and write "# stopped early: WHY" to TS. For runs
                         whose result is void once a known failure has been printed, so that nobody waits out
                         the rest of SECS.
+--send REGEX KEYS       May be repeated. Type KEYS on the line, once, after the first complete line that matches
+                        REGEX. KEYS are separated by commas: up, down, left, right, enter, esc, space, tab,
+                        text:ANYTHING, wait:SECONDS; the keys follow each other 0.3 s apart. The same process
+                        reads and writes, so the answer to the keys is in RAW and TS (a second reader would
+                        take bytes away). For a boot menu with a countdown:
+                        --send 'menu: shown' up,up,wait:1,enter
+                        The device is then opened for writing as well; without --send nothing is ever written.
 """
 import argparse
 import os
@@ -28,18 +35,42 @@ import signal
 import sys
 import time
 
+KEY_BYTES = {"up": b"\x1b[A", "down": b"\x1b[B", "right": b"\x1b[C", "left": b"\x1b[D", "enter": b"\r", "esc": b"\x1b",
+             "space": b" ", "tab": b"\t"}
+KEY_GAP = 0.3
+
+
+def parse_keys(spec):
+    """KEYS -> [(delay before it in seconds, bytes)]; a wait:N adds N seconds to the delay of the next key."""
+    out, extra = [], 0.0
+    for token in spec.split(","):
+        if token.startswith("wait:"):
+            extra += float(token[5:])
+        elif token.startswith("text:"):
+            out.append((KEY_GAP + extra, token[5:].encode()))
+            extra = 0.0
+        elif token in KEY_BYTES:
+            out.append((KEY_GAP + extra, KEY_BYTES[token]))
+            extra = 0.0
+        else:
+            raise SystemExit("--send: unknown key %r (up down left right enter esc space tab text:X wait:N)" % token)
+    return out
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stop", nargs=3, action="append", default=[], metavar=("REGEX", "SECS", "WHY"))
+    ap.add_argument("--send", nargs=2, action="append", default=[], metavar=("REGEX", "KEYS"))
     ap.add_argument("dev")
     ap.add_argument("secs", type=float)
     ap.add_argument("raw")
     ap.add_argument("ts")
     args = ap.parse_args()
     rules = [(re.compile(r.encode()), float(s), why) for r, s, why in args.stop]
+    sends = [[re.compile(r.encode()), parse_keys(k), k, False] for r, k in args.send]
+    pending = []  # (time to type at, bytes)
 
-    fd = os.open(args.dev, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    fd = os.open(args.dev, (os.O_RDWR if sends else os.O_RDONLY) | os.O_NOCTTY | os.O_NONBLOCK)
     raw = open(args.raw, "wb", buffering=0)
     ts = open(args.ts, "w", buffering=1, encoding="utf-8", errors="replace")
     t0 = time.monotonic()
@@ -71,6 +102,10 @@ def main():
         if deadline is not None and now >= deadline:
             ts.write("# stopped early: %s\n" % why)
             break
+        while pending and pending[0][0] <= now:
+            _, keys = pending.pop(0)
+            os.write(fd, keys)
+            ts.write("# [%8.3f] typed %r\n" % (now, keys))
         r, _, _ = select.select([fd], [], [], 0.1)
         if r:
             try:
@@ -88,6 +123,15 @@ def main():
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     emit(line, line_t)
+                    for entry in sends:
+                        if not entry[3] and entry[0].search(line):
+                            entry[3] = True
+                            at = time.monotonic() - t0
+                            ts.write("# [%8.3f] matched %r, typing %s\n" % (at, entry[0].pattern.decode(), entry[2]))
+                            for delay, keys in entry[1]:
+                                at += delay
+                                pending.append((at, keys))
+                            pending.sort(key=lambda item: item[0])
                     if deadline is None:
                         for rx, secs, reason in rules:
                             if rx.search(line):

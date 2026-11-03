@@ -4,7 +4,7 @@ bus is a directory tree.
 
     python3 selftest.py
 
-Covers serial-capture.py (raw copy, timestamps, partial lines, --stop rules), uboot-cmd.py, usb-lib.sh
+Covers serial-capture.py (raw copy, timestamps, partial lines, --stop rules, --send keys), uboot-cmd.py, usb-lib.sh
 (has_usb, usb_ids, usb_stable with a device that comes late or flaps, uboot_grab_cli) and hw-reset.sh.
 Needs python3 3.8 or newer, bash and coreutils; takes about 20 s.
 """
@@ -119,6 +119,42 @@ def test_serial_capture(tmp):
     p.wait(timeout=10)
     text = open(ts, encoding="utf-8").read()
     check("capture: a rule that never matches changes nothing", "stopped early" not in text and "# capture end" in text, text)
+    line.close()
+
+    line = FakeLine()
+    raw, ts = os.path.join(tmp, "d.raw"), os.path.join(tmp, "d.ts")
+    p = subprocess.Popen([sys.executable, os.path.join(HERE, "serial-capture.py"),
+                          "--send", "menu: shown", "up,up,wait:0.5,enter,text:ab",
+                          "--send", "NEVER", "esc", line.path, "5", raw, ts])
+    time.sleep(0.4)
+    line.say(b"firmware\r\nUNIXNU: menu: shown 5 entries\r\n")
+    time.sleep(2.5)  # the last key goes out 0.3 + 0.3 + (0.5 + 0.3) + 0.3 s after the line
+    typed = line.received
+    line.say(b"UNIXNU: menu: shown 5 entries\r\n")  # the menu prints the line twice: the keys go out once
+    p.wait(timeout=10)
+    text = open(ts, encoding="utf-8").read()
+    check("capture: --send types the keys after the matching line", typed == b"\x1b[A\x1b[A\rab", repr(typed))
+    check("capture: --send types once, a later match and a rule that never matches add nothing",
+          line.received == b"\x1b[A\x1b[A\rab", repr(line.received))
+    check("capture: --send is noted in TS and the bytes read are still in RAW",
+          "typing up,up,wait:0.5,enter,text:ab" in text and b"menu: shown" in open(raw, "rb").read(), text)
+    line.close()
+
+    line = FakeLine()
+    raw, ts = os.path.join(tmp, "e.raw"), os.path.join(tmp, "e.ts")
+    p = subprocess.Popen([sys.executable, os.path.join(HERE, "serial-capture.py"),
+                          "--send", "x", "frobnicate", line.path, "1", raw, ts], stderr=subprocess.PIPE)
+    err = p.communicate(timeout=10)[1].decode()
+    check("capture: --send refuses an unknown key", p.returncode != 0 and "unknown key" in err, err)
+    line.close()
+
+    line = FakeLine()
+    raw, ts = os.path.join(tmp, "f.raw"), os.path.join(tmp, "f.ts")
+    p = subprocess.Popen([sys.executable, os.path.join(HERE, "serial-capture.py"), line.path, "1.5", raw, ts])
+    time.sleep(0.4)
+    line.say(b"menu: shown\r\n")
+    p.wait(timeout=10)
+    check("capture: without --send nothing is ever written to the line", line.received == b"", repr(line.received))
     line.close()
 
 
