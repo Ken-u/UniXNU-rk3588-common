@@ -148,6 +148,21 @@ def test_serial_capture(tmp):
     check("capture: --send refuses an unknown key", p.returncode != 0 and "unknown key" in err, err)
     line.close()
 
+    fifo = os.path.join(tmp, "g.fifo")
+    os.mkfifo(fifo)
+    raw, ts = os.path.join(tmp, "g.raw"), os.path.join(tmp, "g.ts")
+    t0 = time.time()
+    p = subprocess.Popen([sys.executable, os.path.join(HERE, "serial-capture.py"), fifo, "30", raw, ts])
+    writer = os.open(fifo, os.O_WRONLY)  # the capture opened the read side without blocking
+    time.sleep(0.4)
+    os.write(writer, b"alive\r\n")
+    time.sleep(0.3)
+    os.close(writer)  # the other side goes away: read returns 0 bytes from now on
+    p.wait(timeout=15)
+    took = time.time() - t0
+    text = open(ts, encoding="utf-8").read()
+    check("capture: a device that hangs up ends the run and says so", took < 5 and "# device closed" in text and "alive" in text, "%.1f s\n%s" % (took, text))
+
     line = FakeLine()
     raw, ts = os.path.join(tmp, "f.raw"), os.path.join(tmp, "f.ts")
     p = subprocess.Popen([sys.executable, os.path.join(HERE, "serial-capture.py"), line.path, "1.5", raw, ts])

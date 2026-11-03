@@ -12,6 +12,10 @@ Equivalent to `timeout SECS cat DEV > RAW` (one reader; the line settings are th
 Why: on a board without a screen the time is the signal (how long after ExitBootServices the board resets,
 where a boot stalls). A log made by cat has no times.
 
+If the device goes away (unplugged, or an adapter that drops off the bus when the board resets) the capture stops at once and
+says so in TS; it does not reopen the device (a second reader could not be told apart from a stolen one: restart it, with
+/dev/serial/by-id/... as DEV when the name changes).
+
 Time zero is the start of this script (monotonic clock). A line that stays unfinished for 0.5 s is written
 with a trailing " ⏎"; the bytes that follow start a new line with their own time.
 
@@ -110,10 +114,15 @@ def main():
         if r:
             try:
                 data = os.read(fd, 4096)
+                if not data:
+                    # readable but nothing to read: the line hung up (an adapter that dropped off the bus, as the FT232 does
+                    # when the board resets). Do not spin on it silently until SECS are over.
+                    ts.write("# device closed (hang-up or unplugged); the adapter may have come back under another name\n")
+                    break
             except BlockingIOError:
                 data = b""
             except OSError as e:
-                ts.write("# read error: %s\n" % e)
+                ts.write("# read error: %s (the adapter may have come back under another name)\n" % e)
                 break
             if data:
                 raw.write(data)
