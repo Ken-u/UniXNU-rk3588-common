@@ -316,6 +316,17 @@ def test_uboot_put(tmp):
           out.stdout + out.stderr + repr(fake.errors))
     line.close()
     line = FakeLine()
+    fake = FakeUBoot(line)
+    out = run([sys.executable, os.path.join(HERE, "uboot-put.py"), "--dev", line.path, "--avoid", "0x1000400-0x2000000", path, "0x1000000"], timeout=30)
+    check("uboot-put: --avoid refuses a transfer that overlaps the range, and sends nothing",
+          out.returncode != 0 and "overlaps the protected range" in out.stderr and not fake.commands, out.stdout + out.stderr + repr(fake.commands))
+    line.close()
+    line = FakeLine()
+    fake = FakeUBoot(line)
+    out = run([sys.executable, os.path.join(HERE, "uboot-put.py"), "--dev", line.path, "--avoid", "0x1001000-0x2000000", path, "0x1000000"], timeout=30)
+    check("uboot-put: --avoid lets a transfer that ends before the range through", out.returncode == 0 and fake.mem[:2500] == data, out.stdout + out.stderr)
+    line.close()
+    line = FakeLine()
     fake = FakeUBoot(line, corrupt=True)
     out = run([sys.executable, os.path.join(HERE, "uboot-put.py"), "--dev", line.path, path], timeout=30)
     check("uboot-put: a crc32 that differs fails the run", out.returncode == 1 and "U-Boot" in out.stdout and "uboot-put: ok" not in out.stdout,

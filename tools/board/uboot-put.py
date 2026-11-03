@@ -12,6 +12,11 @@ to put it into a file of the ESP. U-Boot reads every number as hex: SIZE without
 the file then grows by the bytes that follow in RAM (the printed last line shows the size in hex). `fatload` and `crc32`
 read it back; the `N bytes read` line of fatload must equal the size of the file.
 
+--avoid START-END       (repeatable; also UBOOT_AVOID, comma separated) RAM that U-Boot must not touch: a transfer or the crc32 over it
+                        that overlaps such a range is refused before anything is sent. Reading protected memory (the trusted
+                        firmware's) is a Data Abort in U-Boot, which then hangs in "Please RESET the board" (the Orange Pi 5:
+                        0x8400000-0x9400000, seen as `reserved` in the firmware's memory map).
+
 Environment: SERIAL_DEV  serial device (default /dev/ttyUSB0)   SERIAL_BAUD  line speed (default 1500000)
 The device must not be open elsewhere (one reader at a time). Prints one line per step; nothing else is written to the
 line besides the `loady` command, the YMODEM packets and a final newline.
@@ -148,6 +153,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dev", default=os.environ.get("SERIAL_DEV", "/dev/ttyUSB0"))
     ap.add_argument("--baud", type=int, default=int(os.environ.get("SERIAL_BAUD", "1500000")))
+    ap.add_argument("--avoid", action="append", default=[], metavar="START-END")
     ap.add_argument("file")
     ap.add_argument("addr", nargs="?", default="0x1000000")
     args = ap.parse_args()
@@ -155,6 +161,11 @@ def main():
     if not data:
         raise SystemExit("uboot-put: %s is empty" % args.file)
     addr = int(args.addr, 0)
+    for spec in args.avoid + [x for x in os.environ.get("UBOOT_AVOID", "").split(",") if x.strip()]:
+        start, end = (int(x, 0) for x in spec.split("-", 1))
+        if addr < end and addr + len(data) > start:
+            raise SystemExit("uboot-put: 0x%x-0x%x overlaps the protected range 0x%x-0x%x (U-Boot would abort and hang)"
+                             % (addr, addr + len(data), start, end))
     line = Line(args.dev, args.baud)
     mark = len(line.seen)
     line.write(b"\r")
