@@ -192,11 +192,13 @@ def test_uboot_cmd():
 
 class FakeUBoot:
     """The console of a U-Boot that has `loady` (YMODEM receiver as xyzModem does it: 'C' for the header and for the data, a
-    NAK for the first EOT) and `crc32`, on the board's side of a FakeLine. `corrupt` makes crc32 lie."""
+    NAK for the first EOT) and `crc32`, on the board's side of a FakeLine. `corrupt` makes crc32 lie; `lose_header` drops the first
+    header packet and asks for it again with a 'C' and then a NAK, the way the board's U-Boot sometimes does."""
     SOH, STX, EOT, ACK, NAK = 1, 2, 4, 6, 21
 
-    def __init__(self, line, corrupt=False, nak_first=False):
+    def __init__(self, line, corrupt=False, nak_first=False, lose_header=False):
         self.line, self.corrupt, self.nak_first, self.buf = line, corrupt, nak_first, b""
+        self.lose_header = lose_header
         self.mode, self.stage, self.mem, self.size, self.seq, self.eots, self.commands = "cmd", None, b"", 0, 0, 0, []
         self.errors = []
         line.on_data = lambda _line, data: self.feed(data)
@@ -242,6 +244,10 @@ class FakeUBoot:
             if len(self.buf) < 133:
                 return False
             packet, self.buf = self.buf[:133], self.buf[133:]
+            if self.lose_header:
+                self.lose_header = False
+                self.line.say(b"CCC" + bytes([self.NAK]))
+                return True
             if packet[0] != self.SOH or not self.crc_ok(packet):
                 self.errors.append("bad header packet")
                 self.line.say(bytes([self.NAK]))
@@ -302,6 +308,12 @@ def test_uboot_put(tmp):
     fake = FakeUBoot(line, nak_first=True)
     out = run([sys.executable, os.path.join(HERE, "uboot-put.py"), "--dev", line.path, path], timeout=30)
     check("uboot-put: a receiver that NAKs the first EOT gets it again", out.returncode == 0 and fake.mem[:2500] == data, out.stdout + out.stderr)
+    line.close()
+    line = FakeLine()
+    fake = FakeUBoot(line, lose_header=True)
+    out = run([sys.executable, os.path.join(HERE, "uboot-put.py"), "--dev", line.path, path], timeout=30)
+    check("uboot-put: a header packet that U-Boot lost (CCC, NAK) is sent again", out.returncode == 0 and fake.mem[:2500] == data and not fake.errors,
+          out.stdout + out.stderr + repr(fake.errors))
     line.close()
     line = FakeLine()
     fake = FakeUBoot(line, corrupt=True)

@@ -107,9 +107,21 @@ def send_ymodem(line, name, data):
     header, blocks, end = ymodem_packets(name, data)
     if line.expect_byte({ord("C")}, 15) is None:
         raise SystemExit("uboot-put: U-Boot did not start the YMODEM receiver (no 'C' within 15 s)")
-    line.write(header)
-    if line.expect_byte({ACK, NAK, CAN}, 5) != ACK:
-        raise SystemExit("uboot-put: the header packet was refused")
+    # The Orange Pi 5's U-Boot sometimes does not take the header packet that follows its first 'C': it keeps sending 'C' once a second
+    # and answers with a NAK some seconds later (seen with the console reading "CCCCCC" and then 0x15), as if the bytes had been lost
+    # while it was busy. A sender then sends the header again; one that waits for the answer for a few seconds and gives up is what
+    # "refused" meant. The header goes again while there is no ACK; only a CAN ends the transfer.
+    mark = len(line.seen)
+    for attempt in range(30):
+        mark = len(line.seen)
+        line.write(header)
+        answer = line.expect_byte({ACK, CAN}, 2.5)
+        if answer == ACK:
+            break
+        if answer == CAN:
+            raise SystemExit("uboot-put: the receiver cancelled at the header packet")
+    else:
+        raise SystemExit("uboot-put: the header packet was not acknowledged after 30 tries (the line said %r)" % bytes(line.seen[mark:])[-200:])
     line.expect_byte({ord("C")}, 5)
     for number, pkt in enumerate(blocks, start=1):
         for attempt in range(10):
