@@ -9,6 +9,7 @@ repository of that board ([`uefi-evb10`](https://github.com/Ken-u/uefi-evb10) is
 | --- | --- |
 | `serial-capture.py` | One reader on the serial line. Writes the bytes as they came and a copy with the elapsed seconds in front of each line. `--stop REGEX SECS WHY` ends a run early once a known failure has been printed; `--send REGEX KEYS` types keys once after a matching line (to pick a boot menu entry through the same reader, e.g. `--send 'menu: shown' up,up,wait:1,enter`; `ctrl-c` is a key too, to stop U-Boot's autoboot) |
 | `uboot-cmd.py` | Sends commands to the U-Boot console and prints the answer up to the next `=> ` |
+| `uboot-put.py` | Loads a file into the RAM of a board at the U-Boot prompt over the serial line (YMODEM, `loady`) and compares U-Boot's `crc32` with its own, so a file of an ESP can be replaced without a second computer attached to the board: `uboot-put.py FILE 0x1000000`, then `uboot-cmd.py "fatwrite nvme 0:1 0x1000000 PATH 0xSIZE"` (U-Boot reads every number as hex), then `fatload` and `crc32` to read it back |
 | `usb-lib.sh` | Sourced by shell tools: `has_usb`, `usb_ids`, `usb_stable` (the ids come from sysfs, not lsusb), and `uboot_grab_cli` (interrupt autoboot and wait for the prompt) |
 | `hw-reset.sh` | Presses the board's RESET / RECOVERY / MASKROM keys through an ESP32-S3 controller, locally or through ssh. One attempt, no retry |
 | `showlog.py` | Filters a serial log: drops VT escapes and control characters, selects lines by regular expression |
@@ -34,7 +35,7 @@ The tools that talk to the board run on the machine the board is connected to. A
 needs into the directory of its own scripts on that machine and sources `usb-lib.sh` from there:
 
 ```sh
-scp tools/board/serial-capture.py tools/board/uboot-cmd.py tools/board/usb-lib.sh "$BOARD_HOST:dir/"
+scp tools/board/serial-capture.py tools/board/uboot-cmd.py tools/board/uboot-put.py tools/board/usb-lib.sh "$BOARD_HOST:dir/"
 ```
 
 A repository finds this directory through its own configuration; `uefi-evb10` reads `RK3588_COMMON` from its

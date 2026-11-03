@@ -4,7 +4,8 @@ bus is a directory tree.
 
     python3 selftest.py
 
-Covers serial-capture.py (raw copy, timestamps, partial lines, --stop rules, --send keys), uboot-cmd.py, usb-lib.sh
+Covers serial-capture.py (raw copy, timestamps, partial lines, --stop rules, --send keys), uboot-cmd.py, uboot-put.py (YMODEM
+against a model of U-Boot's receiver), usb-lib.sh
 (has_usb, usb_ids, usb_stable with a device that comes late or flaps, uboot_grab_cli) and hw-reset.sh.
 Needs python3 3.8 or newer, bash and coreutils; takes about 20 s.
 """
@@ -189,6 +190,127 @@ def test_uboot_cmd():
     line.close()
 
 
+class FakeUBoot:
+    """The console of a U-Boot that has `loady` (YMODEM receiver as xyzModem does it: 'C' for the header and for the data, a
+    NAK for the first EOT) and `crc32`, on the board's side of a FakeLine. `corrupt` makes crc32 lie."""
+    SOH, STX, EOT, ACK, NAK = 1, 2, 4, 6, 21
+
+    def __init__(self, line, corrupt=False, nak_first=False):
+        self.line, self.corrupt, self.nak_first, self.buf = line, corrupt, nak_first, b""
+        self.mode, self.stage, self.mem, self.size, self.seq, self.eots, self.commands = "cmd", None, b"", 0, 0, 0, []
+        self.errors = []
+        line.on_data = lambda _line, data: self.feed(data)
+
+    def feed(self, data):
+        self.buf += data
+        while True:
+            if self.mode == "cmd":
+                if b"\r" not in self.buf:
+                    return
+                command, self.buf = self.buf.split(b"\r", 1)
+                self.command(command.decode())
+            elif not self.ymodem():
+                return
+
+    def command(self, text):
+        self.commands.append(text)
+        if text.startswith("loady"):
+            self.line.say(b"loady\r\n## Ready for binary (ymodem) download to 0x01000000 at 1500000 bps...\r\n")
+            self.mode, self.stage, self.mem, self.eots = "y", "header", b"", 0
+            self.line.say(b"C")
+        elif text.startswith("crc32"):
+            import zlib
+            size = int(text.split()[2], 0)
+            crc = zlib.crc32(self.mem[:size]) & 0xFFFFFFFF
+            if self.corrupt:
+                crc ^= 1
+            self.line.say(("crc32 for 01000000 ... ==> %08x\r\n=> " % crc).encode())
+        else:
+            self.line.say(b"\r\n=> ")
+
+    def crc_ok(self, packet):
+        sys.path.insert(0, HERE)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("uboot_put", os.path.join(HERE, "uboot-put.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        body = packet[3:-2]
+        return module.crc16(body).to_bytes(2, "big") == packet[-2:] and packet[1] + packet[2] == 255
+
+    def ymodem(self):
+        if self.stage == "header":
+            if len(self.buf) < 133:
+                return False
+            packet, self.buf = self.buf[:133], self.buf[133:]
+            if packet[0] != self.SOH or not self.crc_ok(packet):
+                self.errors.append("bad header packet")
+                self.line.say(bytes([self.NAK]))
+                return True
+            body = packet[3:-2]
+            self.line.say(bytes([self.ACK]))
+            if body == bytes(128):
+                # what the Orange Pi 5's U-Boot prints after a good transfer: four CAN, four BS, a timeout and an "abort"
+                self.line.say(b"\x18\x18\x18\x18\x08\x08\x08\x08\r\nTimed out\r\n## Binary (ymodem) download aborted\r\n=> ")
+                self.mode = "cmd"
+                return True
+            self.size = int(body.split(b"\0")[1])
+            self.stage, self.seq = "data", 1
+            self.line.say(b"C")
+            return True
+        if not self.buf:
+            return False
+        if self.buf[0] == self.EOT:
+            self.buf = self.buf[1:]
+            self.eots += 1
+            self.line.say(bytes([self.NAK if self.eots == 1 and self.nak_first else self.ACK]))
+            if self.eots > 1 or not self.nak_first:
+                self.stage = "header"
+                self.line.say(b"C")
+            return True
+        if len(self.buf) < 1029:
+            return False
+        packet, self.buf = self.buf[:1029], self.buf[1029:]
+        if packet[0] != self.STX or packet[1] != self.seq & 0xFF or not self.crc_ok(packet):
+            self.errors.append("bad data packet %d" % self.seq)
+            self.line.say(bytes([self.NAK]))
+            return True
+        self.mem += packet[3:-2]
+        self.seq += 1
+        self.line.say(bytes([self.ACK]))
+        return True
+
+
+def test_uboot_put(tmp):
+    import random
+    rnd = random.Random(7)
+    for size, label in ((3000, "a file of three packets"), (1024, "a file of exactly one packet"), (1, "a file of one byte")):
+        data = bytes(rnd.getrandbits(8) for _ in range(size))
+        path = os.path.join(tmp, "put.bin")
+        open(path, "wb").write(data)
+        line = FakeLine()
+        fake = FakeUBoot(line)
+        out = run([sys.executable, os.path.join(HERE, "uboot-put.py"), "--dev", line.path, path, "0x1000000"], timeout=30)
+        check("uboot-put: %s arrives and U-Boot's crc32 agrees" % label,
+              out.returncode == 0 and "uboot-put: ok" in out.stdout and fake.mem[:size] == data and not fake.errors,
+              out.stdout + out.stderr + repr(fake.errors))
+        check("uboot-put: %s, the commands are loady at the address and crc32 over the exact size" % label,
+              fake.commands[-2:] == ["loady 0x1000000 1500000", "crc32 0x1000000 0x%x" % size], repr(fake.commands))
+        line.close()
+    data = bytes(rnd.getrandbits(8) for _ in range(2500))
+    open(path, "wb").write(data)
+    line = FakeLine()
+    fake = FakeUBoot(line, nak_first=True)
+    out = run([sys.executable, os.path.join(HERE, "uboot-put.py"), "--dev", line.path, path], timeout=30)
+    check("uboot-put: a receiver that NAKs the first EOT gets it again", out.returncode == 0 and fake.mem[:2500] == data, out.stdout + out.stderr)
+    line.close()
+    line = FakeLine()
+    fake = FakeUBoot(line, corrupt=True)
+    out = run([sys.executable, os.path.join(HERE, "uboot-put.py"), "--dev", line.path, path], timeout=30)
+    check("uboot-put: a crc32 that differs fails the run", out.returncode == 1 and "U-Boot" in out.stdout and "uboot-put: ok" not in out.stdout,
+          out.stdout + out.stderr)
+    line.close()
+
+
 def bash(script, env=None, timeout=60):
     return run(["bash", "-c", script], env=env, timeout=timeout)
 
@@ -292,6 +414,7 @@ def main():
     try:
         test_serial_capture(tmp)
         test_uboot_cmd()
+        test_uboot_put(tmp)
         test_usb_lib(tmp)
         test_grab_cli(tmp)
         test_hw_reset(tmp)
