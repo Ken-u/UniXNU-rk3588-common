@@ -16,9 +16,10 @@
 //
 // The firmware (edk2-rk3588 / U-Boot) does not touch the decoder; the self-test finds out what state it leaves the power domain, clocks and resets in.
 //
-// Boot argument rk3588-vdec=N: 0 off (default); 1 look only (print the PMU and CRU state that concerns the decoder; nothing is written);
-// 2 also power the domain on, set the clocks, release the resets and read the block's identification and IOMMU registers;
-// 3 also replay the trace once and compare the pictures; 4 as 3, repeated rk3588-vdec-passes=N times (default 20) for timing.
+// Boot argument rk3588-vdec=N: 0 off (default); 1 look only (print the PMU and CRU state that concerns the decoder: power domains, PLL rates; nothing is written);
+// 2 also power the domains on, set the clocks, release the resets and read the block's identification and IOMMU registers;
+// 3 also replay every embedded trace once and compare the pictures; 4 as 3, repeated rk3588-vdec-passes=N times (default 20) for timing.
+// rk3588-vdec-dump=1 hex-dumps the output picture of the first job that does not match.
 #pragma once
 #include <stdint.h>
 
