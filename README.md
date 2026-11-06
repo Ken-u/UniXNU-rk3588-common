@@ -47,6 +47,10 @@ an optional redistributor-based IPI path, and lets the boot core be any
 logical core (the secondaries that queue before it registers are finished
 from slot 0). A device repository lists
 `apply-armcpu-patches.py` in `[kernel] archives` ahead of `component:ArmCpu`.
+The patches apply to the ArmCpu revision of the UniXNU `components.toml`:
+`93a5030` (UniXNU `e2fdae4`, 2026-11-06) and what follows it. They do not
+apply to the older `9066b53` (UniXNU `066c8d8`); the series for that revision
+is the one before the commit that rebased it.
 
 ## Frequency management
 
