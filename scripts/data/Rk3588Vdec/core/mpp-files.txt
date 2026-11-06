@@ -1,0 +1,40 @@
+# The sources of MPP (rockchip-linux/mpp, the commit in core/mpp.lock) that the decoder core compiles unmodified. One path per line, relative to the
+# checkout. core/derive-mpp.py adds mpp_sys_cfg_proc.c (a cut of mpp/base/mpp_sys_cfg.c).
+
+# the H.264 parser
+mpp/codec/dec/h264/h264d_api.c
+mpp/codec/dec/h264/h264d_dpb.c
+mpp/codec/dec/h264/h264d_fill.c
+mpp/codec/dec/h264/h264d_init.c
+mpp/codec/dec/h264/h264d_parse.c
+mpp/codec/dec/h264/h264d_pps.c
+mpp/codec/dec/h264/h264d_scalist.c
+mpp/codec/dec/h264/h264d_sei.c
+mpp/codec/dec/h264/h264d_slice.c
+mpp/codec/dec/h264/h264d_sps.c
+mpp/codec/dec/common/h2645d_sei.c
+mpp/codec/mpp_parser.c
+
+# decoded picture bookkeeping, frames, packets, bit reader / writer
+mpp/base/mpp_buf_slot.c
+mpp/base/mpp_frame.c
+mpp/base/mpp_packet.c
+mpp/base/mpp_bitread.c
+mpp/base/mpp_bitput.c
+
+# the register generator of the rkvdec2 block
+mpp/hal/mpp_hal.c
+mpp/hal/rkdec/h264d/hal_h264d_vdpu34x.c
+mpp/hal/rkdec/h264d/hal_h264d_com.c
+mpp/hal/rkdec/h264d/hal_h264d_vdpu_com.c
+mpp/hal/rkdec/h264d/hal_h264d_rkv_reg.c
+mpp/hal/common/hal_bufs.c
+mpp/hal/rkdec/common/vdpu34x_com.c
+mpp/hal/rkdec/common/vdpu38x_com.c
+mpp/hal/rkdec/common/vdpu_com.c
+
+# operating-system layer that is plain C
+osal/mpp_mem_pool.c
+osal/mpp_callback.c
+osal/mpp_common.c
+osal/osal_2str.c

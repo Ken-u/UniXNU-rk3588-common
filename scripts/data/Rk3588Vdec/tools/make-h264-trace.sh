@@ -14,11 +14,13 @@
 # 9b56348, built unmodified for the host with BUILD_TEST=ON: test/mpi_dec_test; the traces in ../traces were recorded with these two). Environment: AVCENC, AVCDEC, MPI_DEC_TEST (paths). Arguments:
 #   [ENC_EXTRA='--entropy 0 --bframes 0'] make-h264-trace.sh NAME WIDTH HEIGHT FRAMES WORKDIR
 # ENC_EXTRA replaces the encoder options that select the tool set (default: CABAC, no B pictures).
+# TRACE_OUT (default ../traces) is where the .vdt goes. traces/mpp-nt/ holds the same streams recorded with MPP's no-thread test (MPI_DEC_TEST=.../mpi_dec_nt_test:
+# one job after the other, one register set, buffers reused the way core/VdecCore.c does it); ../traces has them from the threaded test (two register sets in turn).
 set -e
 name=$1 width=$2 height=$3 frames=$4 work=$5
 [ -n "$work" ] || { sed -n 3,16p "$0"; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
-out="$here/../traces"
+out="${TRACE_OUT:-$here/../traces}"
 mkdir -p "$work" "$out"
 cd "$work"
 cc -O1 -g -Wall -shared -fPIC -o trace-shim.so "$here/trace-shim.c" -ldl -lpthread
