@@ -21,7 +21,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 out="$here/../traces"
 mkdir -p "$work" "$out"
 cd "$work"
-cc -O1 -g -Wall -shared -fPIC -o trace-shim.so "$here/trace-shim.c" -ldl
+cc -O1 -g -Wall -shared -fPIC -o trace-shim.so "$here/trace-shim.c" -ldl -lpthread
 "${PYTHON_NUMPY:-/usr/bin/python3}" "$here/gen-yuv.py" "$width" "$height" "$frames" "$name.src.yuv"
 "$AVCENC" --input "$name.src.yuv" --output "$name.h264" --width "$width" --height "$height" --num_frames "$frames" --rc 0 --qp_i 28 --qp_p 30 \
   --i_interval "$frames" --idr_interval "$frames" --profile MAIN ${ENC_EXTRA:---entropy 1 --bframes 0} --recon_enable 1 --recon "$name.recon.yuv" \

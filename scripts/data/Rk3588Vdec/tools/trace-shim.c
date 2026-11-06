@@ -14,6 +14,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -55,6 +56,7 @@ static int gJob;
 static uint32_t gClientType;
 static struct { void *p; uint32_t size, offset; } gRdQ[64]; static int gRdHead, gRdTail;   // read-back slots (MPP_CMD_SET_REG_READ) of the submitted jobs, oldest first
 static int gBatchHasWrite;
+static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;   // MPP's parser and HAL threads call ioctl at the same time (H.265 parses the next picture while the last one is submitted); a batch is handled whole
 
 static void init(void) {
   if (real_open) return;
@@ -203,7 +205,7 @@ static int mpp_request(ReqV1 *r) {
   uint32_t *u32 = (uint32_t *)(uintptr_t)r->data_ptr;
   switch (r->cmd) {
     case 0x000: *u32 = 1u << 9; return 0;                       // PROBE_HW_SUPPORT: RKVDEC only
-    case 0x001: *u32 = 0x3588; return 0;                        // QUERY_HW_ID
+    case 0x001: *u32 = 0x53813f05; return 0;                    // QUERY_HW_ID: what the block's ID register reads on the board (HWID_VDPU38X in MPP: the H.265 HAL takes its vdpu34x path only for this)
     case 0x002: {                                               // QUERY_CMD_SUPPORT: how many commands of the group are valid
       uint32_t butt = *u32;
       if (butt == 0x301) *u32 = 0x301;                          // poll group: HW_FINISH only (no per-slice IRQ polling)
@@ -266,14 +268,16 @@ int ioctl(int fd, unsigned long req, ...) {
     if (gKind[fd] == K_MPP) {
       ReqV1 *r = (ReqV1 *)arg;
       int rc = 0;
+      pthread_mutex_lock(&gLock);
       gBatchHasWrite = 0;
       for (;;) {
         rc = mpp_request(r);
-        if (rc) return rc;
+        if (rc) { pthread_mutex_unlock(&gLock); return rc; }
         if (!(r->flag & 1) || (r->flag & 2)) break;
         r++;
       }
       if (gBatchHasWrite) finish_job();   // a submission: the register image is complete now (the next one may follow before the first is polled)
+      pthread_mutex_unlock(&gLock);
       return 0;
     }
     if (gKind[fd] == K_BUF) return 0;   // DMA_BUF_IOCTL_SYNC, DMA_BUF_SET_NAME, ...
