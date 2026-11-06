@@ -20,7 +20,7 @@
  
  extern "C" {
  volatile uint32_t armcpu_registered = 0;
-@@ -46,6 +52,7 @@
+@@ -51,6 +57,7 @@
  // System registers seen on each secondary core at initCPU entry: CurrentEL, SCTLR_EL1, TCR_EL1, MAIR_EL1 (low words), MIDR_EL1.
  volatile uint32_t armcpu_smp_sys[8][5], armcpu_boot_sys[5];
  volatile int32_t armcpu_smp_psci_rc[8];
@@ -28,7 +28,7 @@
  }
  
  #define ARMCPU_SMP_SLOTS 8
-@@ -138,6 +145,25 @@
+@@ -154,6 +161,25 @@
    return value;
  }
  
@@ -51,10 +51,10 @@
 +  return static_cast<uint32_t> ((c1 - c0) * freq / (t1 - t0) / 1000000);
 +}
 +
+ // Polls until the bits clear. The limit counts polls as well as time: the counter runs on while the host has this vCPU's thread
+ // descheduled, so a time limit alone (it was 100 ms) can fail a wake that had no chance to complete.
  static bool waitClear (uintptr_t base, unsigned offset, uint32_t mask)
- {
-   uint64_t frequency;
-@@ -543,6 +569,7 @@
+@@ -588,6 +614,7 @@
      setCPUState (kIOCPUStateRunning);
      armcpu_smp_step[logicalId] = 7;
      armcpu_smp_running = armcpu_smp_running + 1;
@@ -62,15 +62,15 @@
      // XNU clears SIGPdisabled for a core the first time that core takes an IPI, and cpu_signal() silently skips a core until then; Apple's
      // CPU driver provokes it with a self-IPI from initCPU (osfmk/kern/machine.c, processor_up).
      if (gSelfIpi) { signalCPU (this); }
-@@ -559,6 +586,7 @@
+@@ -605,6 +632,7 @@
    if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
    enableCPUTimeBase (true);
    setCPUState (kIOCPUStateRunning);
 +  armcpu_core_mhz[logicalId & 7] = measureMhz ();
+   bootInitialized = true;
    if (gSelfIpi) { signalCPU (this); }
  }
- 
-@@ -774,7 +802,24 @@
+@@ -828,7 +856,24 @@
    uintptr_t line = static_cast<uintptr_t> (4) << ((ctr >> 16) & 15);
    uintptr_t address = reinterpret_cast<uintptr_t> (start) & ~(line - 1), end = reinterpret_cast<uintptr_t> (start) + length;
    for (; address < end; address += line) { __asm__ volatile ("dc civac, %0" :: "r" (address) : "memory"); }
@@ -96,7 +96,7 @@
  }
  
  kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
-@@ -789,6 +834,18 @@
+@@ -843,6 +888,18 @@
    cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable
    cleanToMemory (ResetHandlerData, 0x1000);
    cleanToMemory (const_boot_args, 0x1000);

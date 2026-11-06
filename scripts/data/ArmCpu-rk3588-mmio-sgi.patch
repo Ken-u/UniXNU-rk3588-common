@@ -10,9 +10,9 @@
 +static bool gMmioSgi = false;
 +volatile uint32_t armcpu_core_sgi_sent[8];  // per target logical core: IPIs the kernel asked for (compare with armcpu_core_sgi, SGIs taken)
  volatile uint32_t armcpu_irq_phase = 0,armcpu_irq_id = 1023;
- volatile uint32_t armcpu_quiesce_calls = 0,armcpu_halt_calls = 0;
- // Secondary-CPU bring-up evidence (sheng-smp=1). Step values: 1 nub started, 2 registered, 3 start thread running,
-@@ -367,6 +372,9 @@
+ // IRQ drains (ArmCpu::interrupt takes interrupts until none is pending) that took more than 128, and the most one took. A burst
+ // of timer pops is normal under a hypervisor: a vCPU held off its core finds the next deadline rtclock_intr set already past
+@@ -401,6 +406,9 @@
    unsigned spiIpi = 0;
    PE_parse_boot_argn ("armcpu-spi-ipi", &spiIpi, sizeof (spiIpi));
    gSpiIpi = spiIpi == 1;
@@ -22,7 +22,7 @@
    unsigned diagnostic = 0;
    PE_parse_boot_argn("armcpu-diagnostics", &diagnostic, sizeof(diagnostic));
    diagnosePower=diagnostic==1;
-@@ -617,6 +625,14 @@
+@@ -671,6 +679,14 @@
    uint64_t sgi = ((aff & 0xff00000000ULL) << 16) | ((aff & 0xff0000) << 16) |
                   ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
    armcpu_ipi_sent = armcpu_ipi_sent + 1;
