@@ -24,6 +24,7 @@ and [component catalog](https://unixnu.com/reference/components).
 | `patches/xnu/series` | Ordered XNU patches |
 | `scripts/apply-armcpu-patches.py` | Archive step: applies the ArmCpu fixes in `scripts/data/` |
 | `scripts/build-rk3588-dvfs.py`, `scripts/data/Rk3588Dvfs/` | Archive step and sources of the frequency and voltage management (see [Frequency management](#frequency-management)) |
+| `scripts/build-rk3588-xhci.py`, `scripts/data/Rk3588Xhci/` | Archive step and sources of the polled xHCI host driver for the DWC3 controllers (see [USB 3 (xHCI)](#usb-3-xhci)) |
 | `kits/` | Reserved for shared platform operations |
 | `tools/board/` | Host-side bring-up tools shared by RK3588 boards: serial capture with times, U-Boot console, USB helpers, reset controller. Not part of the kernel build; see its [README](tools/board/README.md) |
 
@@ -102,6 +103,30 @@ after a second without work) and every 25 ms takes the top point at 40 % busy or
 at once and down after three windows; a touch holds it at the top for `rk3588-gpu-boost-ms` (default 200); `rk3588-gpu-max` (default 800) caps the setting. Voltage
 first on the way up, last on the way down, from the vendor's table (rk3588s.dtsi `gpu_opp_table`, typical die).
 Not done: the DDR clock (clock id 4: the service has no rate list for it), and an idle state that powers a cluster down.
+
+## USB 3 (xHCI)
+
+`scripts/data/Rk3588Xhci/` is a polled xHCI host driver for the DWC3 blocks of the RK3588 (`GSNPSID 0x5533300a`; the firmware powers the PHYs and
+puts each core into host mode, the driver resets the xHC and takes it from there). The device builds it with `build-rk3588-xhci.py <path>` (same compiler
+record as the kernel, `-Werror`, Mach-O audit; `"build-rk3588-xhci.py <path>"` in `[kernel] archives`, naming one source of its own) and force-loads it,
+and calls `rk3588_xhci_start()` from a probe once the kernel is up. The board source defines `rk3588_xhci_controllers[]` (name, register base, a DMA
+window below 4 GiB for each controller, mapped as normal non-cacheable memory) and `rk3588_xhci_hid_sink` (where decoded keyboard and mouse reports go).
+
+| File | Contents |
+| --- | --- |
+| `XhciRegs.h`, `XhciCore.h` | Register and context layouts; the controller core: reset and start, command / event / transfer rings, slots, Address Device, Configure Endpoint (with the hub fields), Evaluate Context, control transfers, interrupt and bulk TRBs, endpoint recovery, port reset (hot, warm for an Inactive USB 3 link). A computation over a register accessor and one DMA window, no kernel include |
+| `UsbDesc.h`, `HidReport.h` | Descriptor constants and walks, the endpoint context of an endpoint, the layout of a mouse report read from its HID report descriptor |
+| `UsbHost.h` | Root port scan, enumeration (route strings, transaction translators, full speed packet size), hubs (USB 2 and SuperSpeed, one TT or one per port, nested), HID boot keyboards and mice |
+| `Rk3588Xhci.cpp` | The kernel glue: boot argument, mappings, the register accessor, the thread |
+| `tests/` | `XhciModel.h` (a strict model of an xHC and of the devices on its ports) and `test-xhci.cpp`; `tests/run.sh` builds and runs it with the sanitizers |
+
+Boot argument `rk3588-xhci=N`: 0 off (default); 1 print the registers as the firmware left them; 2 also reset and start the controllers and watch the root
+ports; 3 also enumerate what is plugged in (descriptors); 4 also drive hubs; 5 also configure and poll HID boot keyboards and mice.
+
+The test runs the real driver code against the model: enumeration and HID at every speed, 32 and 64 byte contexts, scratchpads, hubs behind hubs, unplugging,
+stalls and a device that never answers, ring and event-ring wraps, slot exhaustion, short data stages. Mutating the driver (the cycle bit at the link TRB,
+PORTSC write hygiene, the TT port, the route string, warm reset, Set TR Dequeue, the residual of a short data stage) makes it fail. That the model agrees with
+a real controller is a separate question: the board runs answer it (a device repository's evidence).
 
 ## Core order
 
