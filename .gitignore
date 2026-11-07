@@ -5,3 +5,4 @@ gpu_files.inc
 *.o
 *.a
 __pycache__/
+scripts/data/Rk3588Vdec/usertest/out/
