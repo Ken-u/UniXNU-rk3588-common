@@ -7,7 +7,8 @@
 //
 //   sel  struct in  struct out   name
 //    0    0x110      0x48        CreateDecoder   width, height, +8 (NAL length size << 24 | size of the extradata), ..., +0xa0 the IOSurface id of the bitstream
-//                                                ring buffer. The extradata (the avcC record: the parameter sets) is at offset 0 of the ring buffer.
+//                                                ring buffer. The extradata (the avcC record, or the hvcC record of H.265: the parameter sets) is at offset 0 of the
+//                                                ring buffer; D5500Stream.h tells the codec from it (and from the first access unit when it is Annex B).
 //                                                Out: +0 the picture buffers the decoder needs (the plug-in's pool is this + 3), +8 the decoder number,
 //                                                +0x10/+0x14 width and height in macroblocks, +0x30 chroma_format_idc, +0x34/+0x38 bit depth - 8 of luma /
 //                                                chroma (the plug-in picks the pixel format of its buffers from these; zeros make it ask for 'L008')
@@ -21,12 +22,14 @@
 //    7    0x10       0x4         SetCallback (asynchronous: frames come back as IOKit asynchronous results)
 //
 // How a frame goes: the plug-in writes the access unit into the ring buffer (an IOSurface both sides map), calls DecodeFrameFig and goes on; the call is queued
-// for a thread of the client's own, which hands the bytes to the decoder core (core/: Rockchip's MPP H.264 parser and rkvdec2 register generator), copies the
+// for a thread of the client's own, which hands the bytes to the decoder core (core/: Rockchip's MPP H.264 / H.265 parser and rkvdec2 register generator), copies the
 // picture the job made into the output slot's IOSurface (NV12), writes a 0x410-byte result record into the ring buffer after the bitstream area and sends the
 // completion (sequence number, status, record index) through the callback. The plug-in's own bookkeeping (what the result record has to say, which buffer
 // references the "kernel" holds) is in the comments at the record writer below.
 //
 // Boot argument rk3588-vdec=7 registers the service; rk3588-vdec-d5500-log=N is how much of the traffic is printed (default 1: the first calls of each kind).
+// H.265: the plug-in registers its HEVC decoders (H264H8Register -> AppleD5500CheckPlatform) only if the service's property HEVCSupported is true, which this
+// service sets; rk3588-vdec-hevc=0 sets it false (and refuses H.265 in CreateDecoder), which is how the plug-in sees a decoder without H.265.
 // The copy of the picture into the output surface is done by the RGA3 block (scripts/data/Rk3588Rga) when that driver is linked and ready (rk3588-rga=5):
 // the decoder's window and each surface are mapped into its address space, and a copy it cannot or does not do is done by the CPU as before.
 // rk3588-vdec-d5500-rga=0 keeps the copy on the CPU.
@@ -43,6 +46,7 @@
 #include <string.h>
 
 #include "../Rk3588Rga/Rk3588Rga.h"
+#include "D5500Stream.h"
 #include "Rk3588Vdec.h"
 #include "VdecTrace.h"
 #include "core/VdecCore.h"
@@ -59,6 +63,8 @@ extern "C" int rk3588_rga_copy_nv12(const struct Rk3588RgaPicture *src, uint32_t
 uint32_t rk3588_rga_map_memory(IOMemoryDescriptor *memory, uint64_t length) __attribute__((weak));
 
 namespace {
+
+using namespace d5500;
 
 enum : uint32_t {
   kSelCreateDecoder = 0, kSelDestroyDecoder = 1, kSelDecodeFrame = 2, kSelMapPixelBuffer = 3, kSelUnmapPixelBuffer = 4, kSelSetCryptSession = 5,
@@ -79,6 +85,7 @@ constexpr uint32_t kMaxStream = 4u << 20;
 
 int gLog = 1;
 bool gRgaWanted = true;   // rk3588-vdec-d5500-rga: false keeps the copy of the pictures on the CPU
+bool gHevc = true;        // rk3588-vdec-hevc: 0 makes "HEVCSupported" false (the plug-in then registers no H.265 decoder) and refuses an H.265 stream
 
 // The block can be used: its driver is in the kernel, wanted, and ready (it is only after its own power-up and self-test).
 bool rgaUsable() { return gRgaWanted && rk3588_rga_ready && rk3588_rga_map_memory && rk3588_rga_copy_nv12 && rk3588_rga_ready() != 0; }
@@ -277,6 +284,7 @@ struct Session {
   size_t paramsLength;
   bool needParams;
   uint32_t nalSize;
+  int codec;   // kVdecH264 or kVdecH265, from the extradata at CreateDecoder
   // set while a job runs, for the decoder core's callback
   const Job *current;
   uint32_t picturesInJob;
@@ -340,229 +348,6 @@ bool copyPicture(const Session *s, const VdecPicture *pic, const Surface &dst, b
   for (uint64_t y = 0; y < (rows + 1) / 2; ++y)
     memcpy(dst.kva + dst.plane[1].offset + y * dst.plane[1].stride, chroma + static_cast<size_t>(y) * pic->hstride, static_cast<size_t>(width));
   return true;
-}
-
-// What the plug-in wants to know about the stream (the hardware of the original reads it from the parameter sets): from the SPS.
-struct StreamInfo {
-  uint32_t profile, level;
-  uint32_t chromaFormat, lumaMinus8, chromaMinus8;   // chroma_format_idc, bit_depth_*_minus8
-  uint32_t widthMbs, heightMbs, numRefFrames;
-  bool frameMbsOnly, valid;
-};
-
-struct BitReader {
-  const uint8_t *data;
-  size_t bits, at;
-  bool bad;
-  uint32_t u1() {
-    if (at >= bits) {
-      bad = true;
-      return 0;
-    }
-    const uint32_t v = (data[at >> 3] >> (7 - (at & 7))) & 1;
-    ++at;
-    return v;
-  }
-  uint32_t u(unsigned n) {
-    uint32_t v = 0;
-    while (n--) v = v << 1 | u1();
-    return v;
-  }
-  uint32_t ue() {
-    unsigned zeros = 0;
-    while (!u1()) {
-      if (bad || ++zeros > 31) {
-        bad = true;
-        return 0;
-      }
-    }
-    return zeros ? ((1u << zeros) - 1 + u(zeros)) : 0;
-  }
-  int32_t se() {
-    const uint32_t k = ue();
-    return (k & 1) ? static_cast<int32_t>((k + 1) / 2) : -static_cast<int32_t>(k / 2);
-  }
-};
-
-// One sequence parameter set (the NAL unit without start code or length, header byte first).
-bool parseSps(const uint8_t *nal, size_t size, StreamInfo *info) {
-  uint8_t rbsp[512];
-  if (size < 5 || size > sizeof rbsp + 1 || (nal[0] & 0x1f) != 7) return false;
-  size_t n = 0;
-  for (size_t i = 1; i < size; ++i) {   // the emulation prevention bytes out
-    if (n >= 2 && rbsp[n - 1] == 0 && rbsp[n - 2] == 0 && nal[i] == 3) continue;
-    rbsp[n++] = nal[i];
-  }
-  BitReader r = {rbsp, n * 8, 0, false};
-  memset(info, 0, sizeof *info);
-  info->profile = r.u(8);
-  (void)r.u(8);
-  info->level = r.u(8);
-  (void)r.ue();   // sps id
-  info->chromaFormat = 1;
-  switch (info->profile) {
-    case 100: case 110: case 122: case 244: case 44: case 83: case 86: case 118: case 128: case 138: case 139: case 134: case 135: {
-      info->chromaFormat = r.ue();
-      if (info->chromaFormat == 3) (void)r.u1();
-      info->lumaMinus8 = r.ue();
-      info->chromaMinus8 = r.ue();
-      (void)r.u1();   // qpprime_y_zero_transform_bypass
-      if (r.u1()) {   // scaling matrices: only their size matters here
-        const unsigned lists = info->chromaFormat != 3 ? 8 : 12;
-        for (unsigned i = 0; i < lists && !r.bad; ++i) {
-          if (!r.u1()) continue;
-          int last = 8, next = 8;
-          for (unsigned j = 0, count = i < 6 ? 16 : 64; j < count; ++j) {
-            if (next) {
-              next = (last + r.se() + 256) % 256;
-            }
-            last = next ? next : last;
-          }
-        }
-      }
-      break;
-    }
-    default: break;
-  }
-  (void)r.ue();   // log2_max_frame_num_minus4
-  const uint32_t pocType = r.ue();
-  if (pocType == 0) {
-    (void)r.ue();
-  } else if (pocType == 1) {
-    (void)r.u1();
-    (void)r.se();
-    (void)r.se();
-    const uint32_t cycle = r.ue();
-    for (uint32_t i = 0; i < cycle && i < 256 && !r.bad; ++i) (void)r.se();
-  }
-  info->numRefFrames = r.ue();
-  (void)r.u1();   // gaps_in_frame_num_value_allowed_flag
-  info->widthMbs = r.ue() + 1;
-  const uint32_t mapUnits = r.ue() + 1;
-  info->frameMbsOnly = r.u1() != 0;
-  info->heightMbs = info->frameMbsOnly ? mapUnits : mapUnits * 2;
-  info->valid = !r.bad && info->widthMbs && info->heightMbs && info->widthMbs <= 1024 && info->heightMbs <= 1024;
-  return info->valid;
-}
-
-// Do the length fields (of `field` bytes) tile the data exactly? What looks like an Annex B start code at the front (00 00 01 ..) can just be the length of a
-// NAL unit of 256..511 bytes behind a four byte field (vt17: a 433 byte slice, 00 00 01 ad, was taken for Annex B), so the stream's own framing, which
-// CreateDecoder announced, is tried first.
-bool tilesAsLengthPrefixed(const uint8_t *data, size_t size, size_t field) {
-  if (field != 1 && field != 2 && field != 4) return false;
-  size_t at = 0;
-  while (at + field <= size) {
-    size_t length = 0;
-    for (size_t k = 0; k < field; ++k) length = length << 8 | data[at + k];
-    if (!length || at + field + length > size) return false;
-    at += field + length;
-  }
-  return at == size && size != 0;
-}
-
-// The extradata of the stream (the avcC record, or parameter sets in Annex B) into the parameter sets as the parser wants them. Returns the number of
-// parameter set NAL units.
-unsigned parseExtradata(const uint8_t *data, size_t size, uint32_t nalSize, uint8_t *out, size_t outSize, size_t *outLength, StreamInfo *info) {
-  size_t n = 0;
-  unsigned units = 0;
-  bool haveInfo = false;
-  auto add = [&](const uint8_t *nal, size_t length) {
-    if (!length || n + 4 + length > outSize) return;
-    out[n] = 0, out[n + 1] = 0, out[n + 2] = 0, out[n + 3] = 1;
-    memcpy(out + n + 4, nal, length);
-    n += 4 + length;
-    ++units;
-    if (!haveInfo && (nal[0] & 0x1f) == 7) haveInfo = parseSps(nal, length, info);
-  };
-  if (size >= 7 && data[0] == 1 && (data[4] & 0xfc) == 0xfc && (data[5] & 0xe0) == 0xe0) {   // avcC
-    size_t at = 5;
-    const unsigned spsCount = data[at++] & 0x1f;
-    for (unsigned i = 0; i < spsCount && at + 2 <= size; ++i) {
-      const size_t length = static_cast<size_t>(data[at]) << 8 | data[at + 1];
-      at += 2;
-      if (at + length > size) break;
-      add(data + at, length);
-      at += length;
-    }
-    if (at < size) {
-      const unsigned ppsCount = data[at++];
-      for (unsigned i = 0; i < ppsCount && at + 2 <= size; ++i) {
-        const size_t length = static_cast<size_t>(data[at]) << 8 | data[at + 1];
-        at += 2;
-        if (at + length > size) break;
-        add(data + at, length);
-        at += length;
-      }
-    }
-  } else if (size >= 4 && data[0] == 0 && data[1] == 0 && (data[2] == 1 || (data[2] == 0 && data[3] == 1)) && !tilesAsLengthPrefixed(data, size, nalSize)) {   // Annex B
-    size_t start = 0;
-    while (start + 3 < size) {
-      size_t body = start + (data[start + 2] == 1 ? 3 : 4);
-      size_t end = body;
-      while (end + 2 < size && !(data[end] == 0 && data[end + 1] == 0 && (data[end + 2] == 1 || (end + 3 < size && data[end + 2] == 0 && data[end + 3] == 1)))) ++end;
-      if (end + 2 >= size) end = size;
-      add(data + body, end - body);
-      start = end;
-    }
-  } else {   // what the plug-in really leaves there: the parameter sets one after the other, each behind a length field of the stream's NAL length size
-    const size_t field = (nalSize == 1 || nalSize == 2 || nalSize == 4) ? nalSize : 4;
-    size_t at = 0;
-    while (at + field <= size) {
-      size_t length = 0;
-      for (size_t k = 0; k < field; ++k) length = length << 8 | data[at + k];
-      at += field;
-      if (!length || at + length > size) break;
-      add(data + at, length);
-      at += length;
-    }
-  }
-  *outLength = n;
-  return units;
-}
-
-// The access unit as the parser wants it: Annex B, and ended by an access unit delimiter. The parser (in the mode the core uses for streams of unknown
-// framing) only knows a picture is complete when the next NAL unit of another picture starts; the delimiter at the end makes it hand the picture over in
-// this call, which is what the plug-in's one-completion-per-call protocol needs. `nals` gets the number of NAL units, `types` the first few types.
-size_t buildStream(Session *s, const uint8_t *data, size_t size, unsigned *nals, uint8_t types[8], bool *annexB) {
-  *nals = 0;
-  if (size + 16 + s->paramsLength > s->scratchSize) return 0;
-  uint8_t *out = s->scratch;
-  size_t n = 0;
-  // the parameter sets first (the plug-in gave them at CreateDecoder, never again), until a job has gone through the core with them
-  if (s->needParams && s->paramsLength) {
-    memcpy(out, s->params, s->paramsLength);
-    n = s->paramsLength;
-  }
-  const bool annex = size >= 4 && data[0] == 0 && data[1] == 0 && (data[2] == 1 || (data[2] == 0 && data[3] == 1)) && !tilesAsLengthPrefixed(data, size, s->nalSize);
-  *annexB = annex;
-  if (annex) {
-    memcpy(out + n, data, size);
-    n += size;
-    for (size_t i = 0; i + 3 < size; ++i)
-      if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && i + 3 < size) {
-        if (*nals < 8) types[*nals] = data[i + 3] & 0x1f;
-        ++*nals;
-      }
-  } else {
-    // length-prefixed (AVCC): the length fields are as long as CreateDecoder said
-    const size_t field = (s->nalSize == 1 || s->nalSize == 2 || s->nalSize == 4) ? s->nalSize : 4;
-    size_t at = 0;
-    while (at + field <= size) {
-      uint32_t length = 0;
-      for (size_t k = 0; k < field; ++k) length = length << 8 | data[at + k];
-      if (!length || at + field + length > size || n + 4 + length + 8 > s->scratchSize) return 0;
-      out[n] = 0, out[n + 1] = 0, out[n + 2] = 0, out[n + 3] = 1;
-      memcpy(out + n + 4, data + at + field, length);
-      if (*nals < 8) types[*nals] = data[at + field] & 0x1f;
-      ++*nals;
-      n += 4 + length;
-      at += field + length;
-    }
-    if (at != size) return 0;
-  }
-  static const uint8_t aud[] = {0, 0, 0, 1, 0x09, 0xf0};
-  memcpy(out + n, aud, sizeof aud);
-  return n + sizeof aud;
 }
 
 void pictureDecoded(void *ctx, const VdecPicture *pic) {
@@ -776,7 +561,8 @@ void AppleD5500UserClient::runJob(const Job &job) {
   if (s->ring.valid() && s->core && static_cast<uint64_t>(job.offset) + job.size <= s->ring.length && job.size) {
     // the plug-in wrote the bytes through its own mapping: whatever the kernel's cache holds for these pages is out of date (or is just not memory yet)
     (void)s->ring.memory->performOperation(kIOMemoryIncoherentIOFlush, job.offset, job.size);
-    length = buildStream(s, s->ring.kva + job.offset, job.size, &nals, types, &annexB);
+    length = frameAccessUnit(s->codec, s->ring.kva + job.offset, job.size, s->nalSize, s->needParams ? s->params : nullptr, s->needParams ? s->paramsLength : 0, s->scratch,
+                             s->scratchSize, &nals, types, &annexB);
     if (gLog >= 1 && s->jobsDone < 4) {
       char hex[3 * 24 + 1] = {};
       for (unsigned i = 0; i < 24 && i < job.size; ++i) snprintf(hex + 3 * i, 4, "%02x ", s->ring.kva[job.offset + i]);
@@ -787,7 +573,7 @@ void AppleD5500UserClient::runJob(const Job &job) {
   const uint64_t prepEndUs = nowUs();
   s->prof.prep += prepEndUs - startUs;
   if (!length) {
-    printf("rk3588-vdec: d5500: frame %u: %u bytes at %u cannot be read as H.264 (%u NAL units)\n", job.seq, job.size, job.offset, nals);
+    printf("rk3588-vdec: d5500: frame %u: %u bytes at %u cannot be read as %s (%u NAL units)\n", job.seq, job.size, job.offset, s->codec == kVdecH265 ? "H.265" : "H.264", nals);
     status = 1;
   } else {
     // 2. the decoder core
@@ -950,7 +736,26 @@ IOReturn AppleD5500UserClient::externalMethod(uint32_t selector, IOExternalMetho
         s->ring.release();
         return kIOReturnNoMemory;
       }
-      if (vdec_core_create(&s->core, &s->hw, kVdecH264) != 0 || !s->core) {
+      // the extradata the plug-in left at the start of the ring buffer: the parameter sets, and with them what the plug-in asks of the "hardware" below; and
+      // which codec this is (H.264: an avcC record; H.265: an hvcC record; the plug-in's codec word at +0x10 is printed with the call's input but not
+      // relied on: its numbering is not decoded)
+      s->nalSize = in[2] >> 24;
+      const uint32_t extraSize = in[2] & 0xffffff;
+      s->codec = kVdecH264;
+      if (extraSize && extraSize <= s->ring.length) {
+        // the plug-in wrote the extradata through its own mapping of the ring buffer: whatever the kernel's cache holds for these pages is out of date
+        (void)s->ring.memory->performOperation(kIOMemoryIncoherentIOFlush, 0, extraSize);
+        s->codec = detectCodec(s->ring.kva, extraSize, s->nalSize);
+      }
+      if (s->codec == kVdecH265 && !gHevc) {
+        printf("rk3588-vdec: d5500: CreateDecoder: an H.265 stream, and H.265 is switched off (rk3588-vdec-hevc=0)\n");
+        IOFree(s->scratch, s->scratchSize);
+        s->scratch = nullptr;
+        s->scratchSize = 0;
+        s->ring.release();
+        return kIOReturnUnsupported;
+      }
+      if (vdec_core_create(&s->core, &s->hw, s->codec) != 0 || !s->core) {
         printf("rk3588-vdec: d5500: CreateDecoder: the decoder core cannot be opened (another client has it?)\n");
         s->core = nullptr;
         IOFree(s->scratch, s->scratchSize);
@@ -961,16 +766,11 @@ IOReturn AppleD5500UserClient::externalMethod(uint32_t selector, IOExternalMetho
       }
       s->width = in[0];
       s->height = in[1];
-      // the extradata the plug-in left at the start of the ring buffer: the parameter sets, and with them what the plug-in asks of the "hardware" below
-      s->nalSize = in[2] >> 24;
-      const uint32_t extraSize = in[2] & 0xffffff;
       StreamInfo info = {};
       s->paramsLength = 0;
       s->needParams = false;
       if (extraSize && extraSize <= s->ring.length) {
-        // the plug-in wrote the extradata through its own mapping of the ring buffer: whatever the kernel's cache holds for these pages is out of date
-        (void)s->ring.memory->performOperation(kIOMemoryIncoherentIOFlush, 0, extraSize);
-        const unsigned units = parseExtradata(s->ring.kva, extraSize, s->nalSize, s->params, sizeof s->params, &s->paramsLength, &info);
+        const unsigned units = parseExtradata(s->codec, s->ring.kva, extraSize, s->nalSize, s->params, sizeof s->params, &s->paramsLength, &info);
         if (!s->paramsLength) {
           // Nothing the parser takes as a parameter set: say so, VideoToolbox then fails the session (and uses the software decoder) instead of getting
           // a picture of the wrong stream. (Before the pmap fix of rk3588-wc-batch-flush.patch this was the sessions whose first cache line of the
@@ -985,7 +785,7 @@ IOReturn AppleD5500UserClient::externalMethod(uint32_t selector, IOExternalMetho
         s->needParams = true;
         char hex[3 * 40 + 1] = {};
         for (unsigned i = 0; i < 40 && i < extraSize; ++i) snprintf(hex + 3 * i, 4, "%02x ", s->ring.kva[i]);
-        printf("rk3588-vdec: d5500: CreateDecoder: %u bytes of extradata, NAL length size %u, %u parameter sets (%u bytes): %s\n", extraSize, s->nalSize, units,
+        printf("rk3588-vdec: d5500: CreateDecoder: %s, codec word %#x, %u bytes of extradata, NAL length size %u, %u parameter sets (%u bytes): %s\n", s->codec == kVdecH265 ? "H.265" : "H.264", in[0x10 / 4], extraSize, s->nalSize, units,
                static_cast<unsigned>(s->paramsLength), hex);
       } else {
         printf("rk3588-vdec: d5500: CreateDecoder: extradata of %u bytes (ring buffer %llu bytes): none used\n", extraSize,
@@ -1002,7 +802,7 @@ IOReturn AppleD5500UserClient::externalMethod(uint32_t selector, IOExternalMetho
       out[0x30 / 4] = info.valid ? info.chromaFormat : 1;
       out[0x34 / 4] = info.lumaMinus8;
       out[0x38 / 4] = info.chromaMinus8;
-      printf("rk3588-vdec: d5500: CreateDecoder: stream %s: profile %u level %u, %ux%u macroblocks, chroma_format_idc %u, bit depth %u/%u, %u reference frames, answering %u picture buffers\n",
+      printf("rk3588-vdec: d5500: CreateDecoder: stream %s: profile %u level %u, %ux%u 16x16 blocks, chroma_format_idc %u, bit depth %u/%u, %u reference frames, answering %u picture buffers\n",
              info.valid ? "from the SPS" : "NOT PARSED, assumed", info.profile, info.level, widthMbs, heightMbs, out[0x30 / 4], 8 + info.lumaMinus8, 8 + info.chromaMinus8,
              info.numRefFrames, dpb);
       if (!s->workerStarted) {
@@ -1108,6 +908,8 @@ extern "C" void rk3588_vdec_serve(void) {
   value = 1;
   if (PE_parse_boot_argn("rk3588-vdec-d5500-rga", &value, sizeof value)) gRgaWanted = value != 0;
   gRgaLock = IOLockAlloc();
+  value = 1;
+  if (PE_parse_boot_argn("rk3588-vdec-hevc", &value, sizeof value)) gHevc = value != 0;
   value = 3;
   (void)PE_parse_boot_argn("rk3588-vdec-mpp-log", &value, sizeof value);
   vdc_log_level = static_cast<int>(value);
@@ -1120,6 +922,9 @@ extern "C" void rk3588_vdec_serve(void) {
   // original kext's), and a process in this comma separated list (names compared up to 16 characters, what the kernel's native_sandbox_grant looks for) is
   // let in anyway.
   service->setProperty("NativeSandboxGrantProcess", "videocodecd,mediaserverd,ptpd");
+  // What the original kext copies from the device tree node /arm-io/vxd: the plug-in (H264H8.videodecoder, AppleD5500CheckPlatform, called by H264H8Register at
+  // the start of videocodecd) reads this property of the first AppleD5500 service as a boolean and registers its H.265 decoder only when it is true.
+  service->setProperty("HEVCSupported", gHevc);
   service->registerService();
   printf("rk3588-vdec: d5500: service \"AppleD5500\" registered\n");
 }

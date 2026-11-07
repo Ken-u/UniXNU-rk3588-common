@@ -40,6 +40,7 @@ typedef struct HevcAu {
   size_t scanned;          // bytes of buf the scanner has looked at
   uint64_t scan;           // the last eight bytes it saw
   int vclSeen;             // a first slice segment of the access unit being collected has been seen (MPP: nal_boundary_detected)
+  size_t vclAtPlus1;       // 1 + the offset in buf of the NAL header of that first slice segment (0: none yet); the unit's pts is the one of the call that held it
   struct {
     size_t at;             // offset in buf where the bytes of one call to vdec_core_decode start
     int64_t pts;
@@ -412,7 +413,14 @@ static int feed(VdecCore *core, const uint8_t *data, size_t size, int64_t pts, i
 static int hevc_emit(VdecCore *core, size_t cut, const VdecSink *sink) {
   HevcAu *au = &core->au;
   // the unit starts at offset 0 and the first segment always does too: its pts is the presentation time given with the first byte of the unit
-  int n = feed(core, au->buf, cut, au->nSeg ? au->seg[0].pts : 0, 0, sink);
+  // The unit's pts is the one given with its first slice segment. (The first byte of the unit can be an access unit delimiter, a parameter set or an SEI that
+  // came with the previous call: a caller that ends each of its calls with a delimiter would see every picture carry the pts of the call before.)
+  unsigned from = 0;
+  if (au->vclAtPlus1)
+    for (unsigned i = 0; i < au->nSeg; i++)
+      if (au->seg[i].at <= au->vclAtPlus1 - 1) from = i;
+  int n = feed(core, au->buf, cut, au->nSeg ? au->seg[from].pts : 0, 0, sink);
+  au->vclAtPlus1 = 0;
   // what is left moves to the front, and the segments with it
   memmove(au->buf, au->buf + cut, au->len - cut);
   au->len -= cut;
@@ -479,8 +487,12 @@ static int hevc_feed(VdecCore *core, const uint8_t *data, size_t size, int64_t p
       }
     } else if (nut <= 9 || (nut >= 16 && nut <= 21)) {   // a slice segment
       if ((au->buf[i] >> 7) && !layer) {
-        if (!au->vclSeen) au->vclSeen = 1;
-        else cut = 1;
+        if (!au->vclSeen) {
+          au->vclSeen = 1;
+          au->vclAtPlus1 = i - 2 + 1;
+        } else {
+          cut = 1;
+        }
       }
     }
     if (cut) {
@@ -488,6 +500,7 @@ static int hevc_feed(VdecCore *core, const uint8_t *data, size_t size, int64_t p
       if (n < 0) return -1;
       out += n;
       au->vclSeen = (nut <= 9 || (nut >= 16 && nut <= 21)) ? 1 : 0;   // the unit that starts here has had its first slice segment if the cut was one
+      if (au->vclSeen) au->vclAtPlus1 = 3 + 1;   // the cut was at the start code (i - 5): the NAL header is the 4th byte of the new unit
     }
   }
 
@@ -497,6 +510,7 @@ static int hevc_feed(VdecCore *core, const uint8_t *data, size_t size, int64_t p
     out += n;
     au->scan = 0;
     au->vclSeen = 0;
+    au->vclAtPlus1 = 0;
   }
   return out;
 }
@@ -535,6 +549,7 @@ void vdec_core_reset(VdecCore *core) {
   core->au.len = core->au.scanned = 0;
   core->au.scan = 0;
   core->au.vclSeen = 0;
+  core->au.vclAtPlus1 = 0;
   core->au.nSeg = 0;
 
   mpp_parser_reset(core->parser);

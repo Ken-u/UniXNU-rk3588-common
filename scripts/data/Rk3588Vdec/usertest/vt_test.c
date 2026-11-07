@@ -1,5 +1,5 @@
 /*
- * VideoToolbox test of the rkvdec2 video decoder: the first user task that asks iPadOS's own decoder stack for H.264 pictures and compares what
+ * VideoToolbox test of the rkvdec2 video decoder: the first user task that asks iPadOS's own decoder stack for H.264 and H.265 pictures and compares what
  * comes back with the CRC-32 of each picture the host decoder produced (the .crc files of streams/).
  *
  * It runs as launchd's job com.apple.ptpd when boot-arg evb10-exec=2 (UniXNU-orangepi5 patches/xnu/opi5-launchd-test.patch: the kernel writes it to
@@ -9,7 +9,7 @@
  * It runs 16 passes (the first right after boot, then after 60 s, then every 30 s) because the failures this test found appeared minutes after boot.
  *
  *   1. IOKit: is there an AppleD5500 service (what AppleD5500OpenConnection of H264H8.videodecoder looks for), and does IOServiceOpen(type 1) work?
- *   2. VTIsHardwareDecodeSupported(H.264).
+ *   2. VTIsHardwareDecodeSupported(H.264) and (HEVC).
  *   3. For each embedded stream: a VTDecompressionSession (hardware preferred, not required), the frames of the stream in decode order, each output
  *      picture's pixel format, size and CRC-32 (NV12, the visible rectangle, luma then chroma), compared as a set with the expected CRCs (the order
  *      of the output depends on the stream's reordering).
@@ -40,7 +40,7 @@ extern const CFStringRef kVTVideoDecoderSpecification_EnableHardwareAcceleratedV
 extern const CFStringRef kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder;
 extern const CFStringRef kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder;
 
-#include "vt_streams.inc"   /* struct VtStream { const char *name; const unsigned char *data; unsigned size; const unsigned *crcs; unsigned crcCount; }; kVtStreams[]; kVtStreamCount */
+#include "vt_streams.inc"   /* struct VtStream { const char *name; int hevc; const unsigned char *data; unsigned size; const unsigned *crcs; unsigned crcCount; }; kVtStreams[]; kVtStreamCount */
 
 static int console = 2;
 
@@ -112,12 +112,12 @@ struct unit {
 struct parsed {
    struct nal nals[MAX_NALS];
    uint32_t nalCount;
-   const struct nal *sps, *pps;
+   const struct nal *vps, *sps, *pps;   /* the VPS only for H.265 */
    struct unit units[MAX_UNITS];
    uint32_t unitCount;
 };
 
-static int parse_annexb(const uint8_t *d, size_t n, struct parsed *out)
+static int parse_annexb(const uint8_t *d, size_t n, int hevc, struct parsed *out)
 {
    memset(out, 0, sizeof *out);
    size_t i = 0;
@@ -145,6 +145,27 @@ static int parse_annexb(const uint8_t *d, size_t n, struct parsed *out)
    }
    for (uint32_t k = 0; k < out->nalCount; ++k) {
       const struct nal *nal = &out->nals[k];
+      if (hevc) {
+         unsigned type = (nal->data[0] >> 1) & 0x3f;
+         if (type == 32 && !out->vps)
+            out->vps = nal;
+         else if (type == 33 && !out->sps)
+            out->sps = nal;
+         else if (type == 34 && !out->pps)
+            out->pps = nal;
+         else if (type <= 9 || (type >= 16 && type <= 21)) {
+            /* first_slice_segment_in_pic_flag (the first bit after the two header bytes) starts a new picture */
+            int firstSlice = nal->size > 2 && (nal->data[2] & 0x80);
+            if (firstSlice || out->unitCount == 0) {
+               if (out->unitCount == MAX_UNITS)
+                  return -1;
+               out->units[out->unitCount++] = (struct unit){k, 1};
+            } else {
+               out->units[out->unitCount - 1].count++;
+            }
+         }
+         continue;
+      }
       unsigned type = nal->data[0] & 0x1f;
       if (type == 7 && !out->sps)
          out->sps = nal;
@@ -162,7 +183,7 @@ static int parse_annexb(const uint8_t *d, size_t n, struct parsed *out)
          }
       }
    }
-   return out->sps && out->pps && out->unitCount ? 0 : -2;
+   return out->sps && out->pps && (!hevc || out->vps) && out->unitCount ? 0 : -2;
 }
 
 /* ---- the decode callback ---- */
@@ -279,20 +300,27 @@ static void cf_set_int(CFMutableDictionaryRef dict, CFStringRef key, int value)
 static int run_stream(const struct VtStream *stream, int requireHardware)
 {
    struct parsed *parsed = malloc(sizeof *parsed);
-   if (!parsed || parse_annexb(stream->data, stream->size, parsed) != 0) {
+   if (!parsed || parse_annexb(stream->data, stream->size, stream->hevc, parsed) != 0) {
       say("vt: %s: cannot split the stream into pictures", stream->name);
       free(parsed);
       return 1;
    }
-   say("vt: %s (%s hardware): %u NAL units, %u pictures, %u expected CRCs", stream->name, requireHardware ? "requiring" : "preferring", parsed->nalCount,
-       parsed->unitCount, stream->crcCount);
+   say("vt: %s (%s, %s hardware): %u NAL units, %u pictures, %u expected CRCs", stream->name, stream->hevc ? "H.265" : "H.264", requireHardware ? "requiring" : "preferring",
+       parsed->nalCount, parsed->unitCount, stream->crcCount);
 
-   const uint8_t *sets[2] = {parsed->sps->data, parsed->pps->data};
-   size_t setSizes[2] = {parsed->sps->size, parsed->pps->size};
    CMVideoFormatDescriptionRef format = NULL;
-   OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, 2, sets, setSizes, 4, &format);
+   OSStatus status;
+   if (stream->hevc) {
+      const uint8_t *sets[3] = {parsed->vps->data, parsed->sps->data, parsed->pps->data};
+      size_t setSizes[3] = {parsed->vps->size, parsed->sps->size, parsed->pps->size};
+      status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(kCFAllocatorDefault, 3, sets, setSizes, 4, NULL, &format);
+   } else {
+      const uint8_t *sets[2] = {parsed->sps->data, parsed->pps->data};
+      size_t setSizes[2] = {parsed->sps->size, parsed->pps->size};
+      status = CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, 2, sets, setSizes, 4, &format);
+   }
    if (status != noErr || !format) {
-      say("vt: %s: CMVideoFormatDescriptionCreateFromH264ParameterSets: %d", stream->name, (int)status);
+      say("vt: %s: CMVideoFormatDescriptionCreateFrom%sParameterSets: %d", stream->name, stream->hevc ? "HEVC" : "H264", (int)status);
       free(parsed);
       return 1;
    }
