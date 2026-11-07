@@ -27,6 +27,7 @@ and [component catalog](https://unixnu.com/reference/components).
 | `scripts/build-rk3588-xhci.py`, `scripts/data/Rk3588Xhci/` | Archive step and sources of the polled xHCI host driver for the DWC3 controllers (see [USB 3 (xHCI)](#usb-3-xhci)) |
 | `scripts/build-rk3588-vdec.py`, `scripts/data/Rk3588Vdec/` | Archive step and sources of the rkvdec2 video decoder bring-up and its self-test (see [Video decoder (rkvdec2)](#video-decoder-rkvdec2)) |
 | `scripts/build-rk3588-rga.py`, `scripts/data/Rk3588Rga/` | Archive step and sources of the RGA3 2D copy block and its IOMMU, used by the video decoder to deliver pictures (see [2D copy (RGA3)](#2d-copy-rga3)) |
+| `scripts/build-rk3588-venc.py`, `scripts/data/Rk3588Venc/` | Archive step and sources of the RKVENC0 video encoder bring-up and its H.264 / H.265 encode-job self-test (see [Video encoder (rkvenc)](#video-encoder-rkvenc)) |
 | `kits/` | Reserved for shared platform operations |
 | `tools/board/` | Host-side bring-up tools shared by RK3588 boards: serial capture with times, U-Boot console, USB helpers, reset controller. Not part of the kernel build; see its [README](tools/board/README.md) |
 
@@ -206,6 +207,36 @@ a copy to an unmapped address stops the block with an error bit and an IOMMU pag
 Through VideoToolbox a 720p frame's time in the service fell from 2.24 to 1.34 ms (the copy from 1.23 ms to 0.34), 320x240 from 0.30 to 0.27 ms, and the pictures stayed right (128 of 128 sessions with the block at 396 MHz and 128 of 128 in the final configuration at 750 MHz; one other 750 MHz boot lost one session to `videocodecd` being killed by a SIGKILL
 0.3 s after the first session was created, before any picture, which the block had no part in).
 Not done: the second RGA3 core and RGA2, other formats, scaling, rotation and colour conversion (the block can do them; nothing asks), completion by interrupt (SPI 114, shared with the IOMMU), master (command list) mode, quality-of-service settings, a copy that runs while the decoder works on the next frame, other boards.
+
+## Video encoder (rkvenc)
+
+`scripts/data/Rk3588Venc/` brings up the RK3588 video encoder block (RKVENC0, "vepu580" in Rockchip's MPP; registers at `0xfdbd0000`, identification word `0x50603312`) from the kernel and replays recorded H.264 and
+H.265 encode jobs on it. **Nothing in iPadOS uses it yet**: the service that VideoToolbox's hardware encoder opens (`AppleAVE2`) is not written, so this is the self-test of the block and of the way to drive it.
+The device builds it with `build-rk3588-venc.py <path>` (the kernel's compile record, `-Werror`, Mach-O audit; the archive embeds `traces/*.vet`), force-loads it and calls `rk3588_venc_start()` from a probe; the board source defines
+`rk3588_venc_config` (a DMA window below 4 GiB, 32 MiB on the Orange Pi 5; the block runs in IOMMU bypass, like the decoder, so buffers are addressed physically).
+
+The method is the decoder's (see above): **the front end is not written here**. Rockchip's own MPP (the H.264 and H.265 encoders: parameter sets, rate control, reference management, and the `vepu580` register generators,
+`mpp/hal/rkenc`) runs unmodified on an x86 host behind an `LD_PRELOAD` shim (`tools/trace-shim-enc.c`: a fake `/dev/mpp_service` and DMA heap) that answers every job "done" and records what MPP submitted: the 1444 (H.264) or
+1644 (H.265) register words of the job, the registers that hold buffer addresses (which buffer, which offset) and the content the CPU had put into the buffers (the input picture, the parameter sets in front of the stream).
+`tools/make-enc-trace.py` packs that into a `VET1` trace; `tools/make-enc-trace.sh` does the whole recording for a synthetic video (the decoder's `gen-yuv.py`). What differs from the decoder is the check: a lossy encoder has no
+reference output to compare bit for bit, so the board prints the bit stream it produced and the host decodes it with libavc or libhevc (`tools/check-enc-output.py`: PSNR against the source pictures; a corrupted byte turns a picture to 17 dB and the check fails).
+
+| File | Contents |
+| --- | --- |
+| `VencTrace.h` | The trace format (`VET1`: per job the register image, the address relocations, the CPU-written runs, where the stream goes), its parser (every length and index checked once) and the player, which does what the vendor driver's `rkvenc_run` does for a task: the VEPU580 forced clear (`0x14` = 2, 5 us, 0), the hardware counter clear (`0x5300` = 2), the register image in ascending order with the buffer addresses relocated into the window, the start register (`0x10`) last, then the interrupt status until done or an error bit (or the time limit), the stream length (`0x4000`), and the status cleared as `rkvenc_irq` does. Plain C++ over a register accessor and one DMA window; a `Player` and a `Trace` are big and are allocated on the heap (the kernel has no placement new: `Player::init`) |
+| `Rk3588Venc.cpp`, `Rk3588Venc.h` | The kernel glue: the PMU domains (VCODEC, VENC0: power request, memory power, repair, the idle request), the clocks (aclk 500 MHz, core 800 MHz asked for; the firmware's PLLs give 500 and 750), the resets (`SOFTRST_CON(47)`), the DMA window mapped through IOKit as for the decoder, the self-test thread |
+| `tools/` | `trace-shim-enc.c`, `make-enc-trace.sh`, `make-enc-trace.py`, `check-enc-output.py` |
+| `traces/` | Twelve recordings, H.264 and H.265 each: 320x240 with an I and a P frame, six P frames, constant bit rate, an IDR every three frames (the parameter sets in front of every IDR); 640x360 (crop to 360 lines) and 1280x720, three frames each |
+| `tests/` | `test-venc.cpp` (a model of the register interface that is strict about the vendor sequence: the clears first, every register of the image once, in order, with its value and the buffer addresses relocated, the CPU-written runs in the window before the start, the start last; the "block" writes a stream where the address register says; error status, a block that never answers, windows that are too small, every truncation of every trace) and `run.sh` (1176 checks, ASan and UBSan); `mutate.sh` breaks the player nine ways and requires the test to fail each time |
+
+Boot argument `rk3588-venc=N`: 0 off (default); 1 look at the power domains, clocks and PLL rates (nothing is written); 2 also power the block, set the clocks, release the resets, read the identification and status registers and do the vendor's safe reset once;
+3 also map the DMA window and replay every trace once, printing for each job the status, the time the block took and the bytes it wrote (32 per line: `rk3588-venc: stream NAME job N OFFSET HEX`); 4 replays them `rk3588-venc-passes=N` times (default 20),
+comparing the stream of every pass with the first's (`rk3588-venc-dump=1` also prints the first pass's). The check on the host: `check-enc-output.py SERIAL.log TRACE.vet SOURCE.yuv W H --decoder avcdec|hevcdec [--codec h265]`.
+Measured on the Orange Pi 5 (`UniXNU-orangepi5/evidence/device-venc-20261108.txt`): the first job of the first run came back done with a valid H.264 IDR slice (the stream starts `00 00 00 01 65`); all twelve traces, 20 passes each, return the same stream on every pass, and all twelve streams decode with the reference decoders
+(PSNR of the luma 37 to 41 dB at the fixed quantizer 28 to 30 and at the constant bit rate, the P frames included, so the reference pictures the block wrote are consistent). Time on the block: 160 us for a 320x240 frame, 443 us for 640x360, 1.72 ms for 1280x720 (H.264 and H.265 alike), the CPU polling.
+The vendor's safe reset (`0x14` = 1, wait for bit 2 of the status) times out on this block; the vendor driver ignores that, and so does this one (it pulses the reset lines instead). Not understood.
+Not done: any user (the `AppleAVE2` ABI and the service), the second encoder (RKVENC1), the encoder's IOMMU, interrupts, other formats (NV12 and 4:2:2 input, FBC), multiple slices and tiles, ROI and the other `mpi_enc_test` features, rate control that depends on what the block wrote (the replay is a fixed register sequence: MPP's rate control saw the shim's invented stream length),
+frame sizes above 720p (the traces are recordings of 1280x720 at most; a 1080p trace would add 6 MB per frame to the repository and the kernel).
 
 ## Core order
 
