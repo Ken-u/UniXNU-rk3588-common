@@ -563,11 +563,15 @@ bool coreTest(unsigned passes, unsigned chunk) {
   return failed == 0;
 }
 
+volatile bool gPowerPending;   // set from the start call until powerUp has returned (success or not)
+
 void vdecThread(void *, wait_result_t) {
   lookPower();
   printf("rk3588-vdec: %u traces built in\n", static_cast<unsigned>(sizeof kVdecTraces / sizeof kVdecTraces[0]));
   if (gMode < 2) return;
-  if (!powerUp()) return;
+  const bool powered = powerUp();
+  gPowerPending = false;   // the RGA driver (Rk3588Rga) waits for this before it powers the domains that hang under this one's
+  if (!powered) return;
   lookBlock();
   if (gMode == 7) {
     rk3588_vdec_serve();
@@ -597,6 +601,11 @@ extern "C" void rk3588_vdec_start(void) {
   gCru = reinterpret_cast<volatile uint32_t *>(cruMap);
   gVdec = reinterpret_cast<volatile uint8_t *>(vdecMap);
   gDma = dmaMap;
+  gPowerPending = gMode >= 2;
   thread_t thread = nullptr;
   if (kernel_thread_start(vdecThread, nullptr, &thread) == KERN_SUCCESS && thread) thread_deallocate(thread);
+  else gPowerPending = false;
 }
+
+// 1 while the decoder's thread has not finished powering VCODEC and VDPU (the parents of the RGA3 domain), 0 afterwards and when there is no decoder.
+extern "C" int rk3588_vdec_power_pending(void) { return gPowerPending ? 1 : 0; }

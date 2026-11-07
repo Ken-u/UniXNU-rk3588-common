@@ -27,6 +27,9 @@
 // references the "kernel" holds) is in the comments at the record writer below.
 //
 // Boot argument rk3588-vdec=7 registers the service; rk3588-vdec-d5500-log=N is how much of the traffic is printed (default 1: the first calls of each kind).
+// The copy of the picture into the output surface is done by the RGA3 block (scripts/data/Rk3588Rga) when that driver is linked and ready (rk3588-rga=5):
+// the decoder's window and each surface are mapped into its address space, and a copy it cannot or does not do is done by the CPU as before.
+// rk3588-vdec-d5500-rga=0 keeps the copy on the CPU.
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOService.h>
@@ -39,12 +42,21 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "../Rk3588Rga/Rk3588Rga.h"
 #include "Rk3588Vdec.h"
 #include "VdecTrace.h"
 #include "core/VdecCore.h"
 #include "core/VdecPlatform.h"
 
 extern "C" void proc_selfname(char *buf, int size);
+
+// The RGA3 driver is optional (a kernel without it still links): its entry points are weak here.
+extern "C" int rk3588_rga_ready(void) __attribute__((weak));
+extern "C" uint32_t rk3588_rga_map_physical(uint64_t phys, uint64_t bytes, int writable) __attribute__((weak));
+extern "C" void rk3588_rga_unmap(uint32_t iova, uint64_t bytes) __attribute__((weak));
+extern "C" int rk3588_rga_copy_nv12(const struct Rk3588RgaPicture *src, uint32_t srcX, uint32_t srcRow, const struct Rk3588RgaPicture *dst, uint32_t width, uint32_t height,
+                                    uint32_t *us) __attribute__((weak));
+uint32_t rk3588_rga_map_memory(IOMemoryDescriptor *memory, uint64_t length) __attribute__((weak));
 
 namespace {
 
@@ -66,6 +78,10 @@ constexpr uint32_t kQueueDepth = 32;
 constexpr uint32_t kMaxStream = 4u << 20;
 
 int gLog = 1;
+bool gRgaWanted = true;   // rk3588-vdec-d5500-rga: false keeps the copy of the pictures on the CPU
+
+// The block can be used: its driver is in the kernel, wanted, and ready (it is only after its own power-up and self-test).
+bool rgaUsable() { return gRgaWanted && rk3588_rga_ready && rk3588_rga_map_memory && rk3588_rga_copy_nv12 && rk3588_rga_ready() != 0; }
 
 // Print the non-zero 32-bit words of a structure as offset:value pairs, a line at a time.
 void printWords(const char *what, const void *data, size_t size) {
@@ -125,6 +141,7 @@ struct Surface {
   uint64_t length;
   uint32_t id, format, planes;
   uint64_t width, height, stride, allocation;
+  uint32_t rga;             // the IO address of byte 0 of the memory in the RGA3's address space, 0 when it is not mapped there
   struct Plane {
     uint64_t stride, offset, height;
   } plane[2];
@@ -135,6 +152,7 @@ struct Surface {
 };
 
 void Surface::release() {
+  if (rga && rk3588_rga_unmap) rk3588_rga_unmap(rga, length);
   if (map) map->release();
   if (memory) {
     (void)memory->complete();
@@ -187,6 +205,7 @@ bool Surface::open(uint32_t surfaceId, bool dump) {
   format = field<uint32_t>(surface, kSurfFormat);
   allocation = field<uint64_t>(surface, kSurfAlloc);
   planes = field<uint32_t>(surface, kSurfPlanes);
+  if (rgaUsable()) rga = rk3588_rga_map_memory(memory, length);   // 0 when it does not fit: this surface is then copied to by the CPU
   const uint8_t *planeArray = field<const uint8_t *>(surface, kSurfPlaneArray);
   const uint32_t planeCount = field<uint32_t>(surface, kSurfPlaneCount);
   plane[0] = {stride, 0, height};
@@ -235,6 +254,7 @@ struct Job {
 struct Profile {
   uint64_t frames, queue, prep, core, pictureCb, flushPre, copy, flushPost, probe, finish;
   uint64_t blockJobs, blockRun, blockWall;   // from the block's job runner, over the same frames
+  uint64_t rgaCopies, rgaUs, rgaFailed, cpuCopies;   // pictures copied by the RGA3 (and the time it ran), pictures it failed on, pictures the CPU copied
 };
 
 struct Session {
@@ -243,6 +263,7 @@ struct Session {
   Surface ring;
   VdecCore *core;
   VdecHw hw;
+  uint32_t rgaSource;   // the IO address of the decoder's window in the RGA3's address space (read-only), 0 when it is not mapped
   uint32_t width, height;
   Job queue[kQueueDepth];
   uint32_t head, count, nextRecord;
@@ -263,14 +284,55 @@ struct Session {
   uint8_t event[4];   // addresses used as wait events
 };
 
-// Copies one decoded picture (NV12 in the DMA window) into an IOSurface of NV12; the surface may be larger or smaller than the picture.
-bool copyPicture(const VdecPicture *pic, const Surface &dst) {
+// The window of the decoder as a source of the RGA3: mapped read-only into its address space the first time it is wanted with the block ready, and kept.
+IOLock *gRgaLock;
+uint32_t gRgaWindow;
+uint64_t gRgaWindowBus;
+uint32_t gRgaWindowBytes;
+bool gRgaWindowTried;
+
+uint32_t rgaWindow(const VdecHw &hw) {
+  if (!gRgaLock || !rgaUsable() || !rk3588_rga_map_physical) return 0;
+  IOLockLock(gRgaLock);
+  if (!gRgaWindow && !gRgaWindowTried) {
+    gRgaWindowTried = true;
+    gRgaWindow = rk3588_rga_map_physical(hw.dmaBus, hw.dmaBytes, 0);
+    gRgaWindowBus = hw.dmaBus;
+    gRgaWindowBytes = hw.dmaBytes;
+    printf("rk3588-vdec: d5500: the decoder's window (%#llx, %u bytes) %s the RGA3's address space%s\n", static_cast<unsigned long long>(hw.dmaBus), hw.dmaBytes,
+           gRgaWindow ? "is in" : "does not fit in", gRgaWindow ? "" : "; the CPU copies the pictures");
+  }
+  const uint32_t iova = gRgaWindow && gRgaWindowBus == hw.dmaBus && gRgaWindowBytes == hw.dmaBytes ? gRgaWindow : 0;
+  IOLockUnlock(gRgaLock);
+  return iova;
+}
+
+// Copies one decoded picture (NV12 in the DMA window) into an IOSurface of NV12; the surface may be larger or smaller than the picture. The RGA3 does it when
+// it can (the surface is mapped in its address space, the sizes and offsets are in its limits); *byBlock says whether it did and *blockUs how long it ran.
+bool copyPicture(const Session *s, const VdecPicture *pic, const Surface &dst, bool *byBlock, uint32_t *blockUs, bool *blockFailed) {
+  *byBlock = false;
+  *blockUs = 0;
+  *blockFailed = false;
   const bool nv12 = dst.format == 0x34323076 /* '420v' */ || dst.format == 0x34323066 /* '420f' */;
   if (!nv12 || dst.planes != 2 || !dst.kva) return false;
   const uint64_t width = pic->width < dst.width ? pic->width : dst.width;
   const uint64_t rows = pic->height < dst.height ? pic->height : dst.height;
   const uint64_t lumaEnd = dst.plane[0].offset + dst.plane[0].stride * rows, chromaEnd = dst.plane[1].offset + dst.plane[1].stride * ((rows + 1) / 2);
   if (width > dst.plane[0].stride || width > dst.plane[1].stride || lumaEnd > dst.length || chromaEnd > dst.length || lumaEnd > dst.plane[1].offset) return false;
+  if (s->rgaSource && dst.rga && dst.plane[0].stride == dst.plane[1].stride && pic->data >= s->hw.dmaVirt) {
+    const uint64_t at = static_cast<uint64_t>(pic->data - s->hw.dmaVirt), chromaAt = at + static_cast<uint64_t>(pic->hstride) * pic->vstride;
+    if (chromaAt + static_cast<uint64_t>(pic->hstride) * pic->vstride / 2 <= s->hw.dmaBytes && dst.length < (1ull << 28)) {
+      const Rk3588RgaPicture source = {static_cast<uint32_t>(s->rgaSource + at), static_cast<uint32_t>(s->rgaSource + chromaAt), pic->hstride};
+      const Rk3588RgaPicture target = {static_cast<uint32_t>(dst.rga + dst.plane[0].offset), static_cast<uint32_t>(dst.rga + dst.plane[1].offset),
+                                       static_cast<uint32_t>(dst.plane[0].stride)};
+      const int rc = rk3588_rga_copy_nv12(&source, pic->cropLeft, pic->cropTop, &target, static_cast<uint32_t>(width), static_cast<uint32_t>(rows), blockUs);
+      if (rc == 0) {
+        *byBlock = true;
+        return true;
+      }
+      *blockFailed = rc != -1;   // -1: not a copy for the block (its limits); the CPU does it without a word. -2: the block failed (and was reset).
+    }
+  }
   const uint8_t *luma = pic->data + static_cast<size_t>(pic->cropTop) * pic->hstride + pic->cropLeft;
   for (uint64_t y = 0; y < rows; ++y)
     memcpy(dst.kva + dst.plane[0].offset + y * dst.plane[0].stride, luma + static_cast<size_t>(y) * pic->hstride, static_cast<size_t>(width));
@@ -516,7 +578,9 @@ void pictureDecoded(void *ctx, const VdecPicture *pic) {
   // (patches/xnu/rk3588-wc-batch-flush.patch); with that fixed this is only a safeguard for surfaces the plug-in leaves cacheable.
   if (dst.valid()) (void)dst.memory->performOperation(kIOMemoryIncoherentIOFlush, 0, dst.length);
   const uint64_t t1 = nowUs();
-  const bool ok = dst.valid() && copyPicture(pic, dst);
+  bool byBlock = false, blockFailed = false;
+  uint32_t blockUs = 0;
+  const bool ok = dst.valid() && copyPicture(s, pic, dst, &byBlock, &blockUs, &blockFailed);
   const uint64_t t2 = nowUs();
   // the reader maps the surface in its own way (the cache mode is the surface's): push what was written out to memory
   if (ok) (void)dst.memory->performOperation(kIOMemoryIncoherentIOFlush, 0, dst.length);
@@ -541,6 +605,13 @@ void pictureDecoded(void *ctx, const VdecPicture *pic) {
   IOLockUnlock(s->lock);
   s->prof.flushPre += t1 - t0;
   s->prof.copy += t2 - t1;
+  if (ok && byBlock) {
+    ++s->prof.rgaCopies;
+    s->prof.rgaUs += blockUs;
+  } else if (ok) {
+    ++s->prof.cpuCopies;
+  }
+  if (blockFailed) ++s->prof.rgaFailed;
   s->prof.flushPost += t3 - t2;
   s->prof.probe += t4 - t3;
   s->prof.pictureCb += t4 - t0;
@@ -783,6 +854,9 @@ static void printProfile(const Session *s) {
          static_cast<unsigned long long>(p.pictureCb / n), static_cast<unsigned long long>(p.flushPre / n), static_cast<unsigned long long>(p.copy / n),
          static_cast<unsigned long long>(p.flushPost / n), static_cast<unsigned long long>(p.probe / n),
          static_cast<unsigned long long>((p.core - p.pictureCb - p.blockWall) / n));
+  if (p.rgaCopies || p.rgaFailed)
+    printf("rk3588-vdec: d5500: profile, copies: %llu by the RGA3 (the block ran %llu us per picture), %llu by the CPU, %llu the RGA3 failed on\n", static_cast<unsigned long long>(p.rgaCopies),
+           static_cast<unsigned long long>(p.rgaCopies ? p.rgaUs / p.rgaCopies : 0), static_cast<unsigned long long>(p.cpuCopies), static_cast<unsigned long long>(p.rgaFailed));
 }
 
 void AppleD5500UserClient::tearDownDecoder() {
@@ -868,6 +942,7 @@ IOReturn AppleD5500UserClient::externalMethod(uint32_t selector, IOExternalMetho
         s->ring.release();
         return kIOReturnNotReady;
       }
+      s->rgaSource = rgaWindow(s->hw);
       s->scratchSize = kMaxStream;
       s->scratch = static_cast<uint8_t *>(IOMallocZero(s->scratchSize));
       if (!s->scratch) {
@@ -1030,6 +1105,9 @@ IOReturn AppleD5500UserClient::externalMethod(uint32_t selector, IOExternalMetho
 extern "C" void rk3588_vdec_serve(void) {
   uint32_t value = 0;
   if (PE_parse_boot_argn("rk3588-vdec-d5500-log", &value, sizeof value)) gLog = static_cast<int>(value);
+  value = 1;
+  if (PE_parse_boot_argn("rk3588-vdec-d5500-rga", &value, sizeof value)) gRgaWanted = value != 0;
+  gRgaLock = IOLockAlloc();
   value = 3;
   (void)PE_parse_boot_argn("rk3588-vdec-mpp-log", &value, sizeof value);
   vdc_log_level = static_cast<int>(value);
