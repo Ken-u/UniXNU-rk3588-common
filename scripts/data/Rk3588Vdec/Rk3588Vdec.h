@@ -48,6 +48,9 @@ struct VdecHw;
 // mapped (rk3588-vdec=2 and up). Only one core may use it at a time.
 int rk3588_vdec_hw(struct VdecHw *hw);
 
+// What the user client's jobs have cost so far: how many, the time from start to interrupt on the block, the time inside the job runner (microseconds).
+void rk3588_vdec_block_stats(uint64_t *jobs, uint64_t *runUs, uint64_t *wallUs);
+
 // Rk3588VdecD5500.cpp: makes and registers the AppleD5500 service (once IOKit is up; called from the driver's thread).
 void rk3588_vdec_serve(void);
 

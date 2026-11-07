@@ -165,6 +165,10 @@ int vdec_core_create(VdecCore **out, const VdecHw *hw, int codec) {
 
 void vdec_core_destroy(VdecCore *core) {
   if (!core) return;
+  // A decoder destroyed without an end of stream still holds pictures that wait for their display turn (a B-frame stream: the last reference) and the
+  // slots of its reference frames; give them back first, as MPP's own teardown does, so that the slot table is clean when it is freed (otherwise
+  // mpp_buf_slot asserts "!slot->status.on_used" in clear_slots_impl).
+  if (core->parser && core->hal && core->frameSlots && core->packetSlots) vdec_core_reset(core);
   if (core->parser) mpp_parser_deinit(core->parser);
   if (core->hal) mpp_hal_deinit(core->hal);
   if (core->frameSlots) mpp_buf_slot_deinit(core->frameSlots);

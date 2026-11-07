@@ -228,6 +228,13 @@ bool Surface::open(uint32_t surfaceId, bool dump) {
 
 struct Job {
   uint32_t seq, size, offset, slot, records;
+  uint64_t queuedUs;   // when DecodeFrame put it in the queue
+};
+
+// Where the time of the frames goes (microseconds, summed over the frames of a decoder; printed when it is destroyed).
+struct Profile {
+  uint64_t frames, queue, prep, core, pictureCb, flushPre, copy, flushPost, probe, finish;
+  uint64_t blockJobs, blockRun, blockWall;   // from the block's job runner, over the same frames
 };
 
 struct Session {
@@ -243,6 +250,7 @@ struct Session {
   uint8_t *scratch;
   size_t scratchSize;
   uint32_t jobsDone, jobsFailed;
+  Profile prof;
   // the stream: its parameter sets (Annex B), put in front of the first access unit and again after the core was reset; the length of the NAL length fields
   uint8_t params[1024];
   size_t paramsLength;
@@ -499,6 +507,7 @@ void pictureDecoded(void *ctx, const VdecPicture *pic) {
   Session *s = static_cast<Session *>(ctx);
   ++s->picturesInJob;
   if (!s->current) return;
+  const uint64_t t0 = nowUs();
   IOLockLock(s->lock);
   const Surface &dst = s->slots[s->current->slot];
   // first push out whatever the cache may still hold dirty for these pages (the buffer's own initialisation): evicted later it would overwrite the
@@ -506,11 +515,14 @@ void pictureDecoded(void *ctx, const VdecPicture *pic) {
   // was the batch path of the pmap, which made the pages of a fresh write-combined surface non-cacheable without taking them out of the cache
   // (patches/xnu/rk3588-wc-batch-flush.patch); with that fixed this is only a safeguard for surfaces the plug-in leaves cacheable.
   if (dst.valid()) (void)dst.memory->performOperation(kIOMemoryIncoherentIOFlush, 0, dst.length);
+  const uint64_t t1 = nowUs();
   const bool ok = dst.valid() && copyPicture(pic, dst);
+  const uint64_t t2 = nowUs();
   // the reader maps the surface in its own way (the cache mode is the surface's): push what was written out to memory
   if (ok) (void)dst.memory->performOperation(kIOMemoryIncoherentIOFlush, 0, dst.length);
-  if (ok && gLog >= 1 && s->jobsDone < 12) {
-    // a probe: the CRC of the picture as the core made it and as it stands in the surface (NV12, visible rectangle: what the test tool computes)
+  const uint64_t t3 = nowUs();
+  if (ok && gLog >= 2 && s->jobsDone < 12) {
+    // a probe (rk3588-vdec-d5500-log=2 and up; it reads the picture twice a byte at a time through uncached memory, 25 ms at 320x240 and 300 ms at 720p, 98 % of a frame's time): the CRC of the picture as the core made it and as it stands in the surface (NV12, visible rectangle: what the test tool computes)
     uint32_t crcSource = 0, crcSurface = 0;
     const uint64_t width = pic->width < dst.width ? pic->width : dst.width, rows = pic->height < dst.height ? pic->height : dst.height;
     const uint8_t *luma = pic->data + static_cast<size_t>(pic->cropTop) * pic->hstride + pic->cropLeft;
@@ -525,7 +537,13 @@ void pictureDecoded(void *ctx, const VdecPicture *pic) {
     }
     printf("rk3588-vdec: d5500: picture of job %u: crc %08x in the core's buffer, %08x in the surface, flags %#x (cpu %d)\n", s->jobsDone + 1, crcSource, crcSurface, pic->flags, int(cpu_number()));
   }
+  const uint64_t t4 = nowUs();
   IOLockUnlock(s->lock);
+  s->prof.flushPre += t1 - t0;
+  s->prof.copy += t2 - t1;
+  s->prof.flushPost += t3 - t2;
+  s->prof.probe += t4 - t3;
+  s->prof.pictureCb += t4 - t0;
   if (ok) s->pictureCopied = true;
   if (!ok || gLog >= 2)
     printf("rk3588-vdec: d5500: picture %ux%u (stride %u, crop %u,%u) pts %lld poc %u flags %#x -> slot %u: %s\n", pic->width, pic->height, pic->hstride, pic->cropLeft,
@@ -675,6 +693,7 @@ void AppleD5500UserClient::runJob(const Job &job) {
   const uint32_t index = s->nextRecord++ % kRecordCount;
   uint32_t status = 0;
   const uint64_t startUs = nowUs();
+  s->prof.queue += startUs - job.queuedUs;
   unsigned nals = 0;
   uint8_t types[8] = {};
   bool annexB = false;
@@ -694,6 +713,8 @@ void AppleD5500UserClient::runJob(const Job &job) {
     }
   }
   IOLockUnlock(s->lock);
+  const uint64_t prepEndUs = nowUs();
+  s->prof.prep += prepEndUs - startUs;
   if (!length) {
     printf("rk3588-vdec: d5500: frame %u: %u bytes at %u cannot be read as H.264 (%u NAL units)\n", job.seq, job.size, job.offset, nals);
     status = 1;
@@ -706,7 +727,13 @@ void AppleD5500UserClient::runJob(const Job &job) {
     sink.ctx = s;
     sink.decoded = pictureDecoded;
     vdec_core_stats(s->core, &before);
+    uint64_t jobs0, run0, wall0, jobs1, run1, wall1;
+    rk3588_vdec_block_stats(&jobs0, &run0, &wall0);
     const int rc = vdec_core_decode(s->core, s->scratch, length, job.seq, 0, &sink);
+    rk3588_vdec_block_stats(&jobs1, &run1, &wall1);
+    s->prof.blockJobs += jobs1 - jobs0;
+    s->prof.blockRun += run1 - run0;
+    s->prof.blockWall += wall1 - wall0;
     vdec_core_stats(s->core, &after);
     s->current = nullptr;
     s->needParams = rc < 0;   // the parameter sets have been seen once the core took a job; a reset forgets them
@@ -723,13 +750,18 @@ void AppleD5500UserClient::runJob(const Job &job) {
       status = 1;
     }
   }
-  const uint64_t us = nowUs() - startUs;
+  const uint64_t endUs = nowUs();
+  const uint64_t us = endUs - startUs;
+  s->prof.core += endUs - prepEndUs;
+  ++s->prof.frames;
   if (status) ++s->jobsFailed;
   if (gLog >= 2 || (gLog >= 1 && s->jobsDone < 8) || status)
     printf("rk3588-vdec: d5500: frame %u: slot %u, %u bytes, %u NAL units, %llu us, status %u (%u frames done, %u failed)\n", job.seq, job.slot, job.size, nals,
            static_cast<unsigned long long>(us), status, s->jobsDone + 1, s->jobsFailed);
   ++s->jobsDone;
+  const uint64_t finishUs = nowUs();
   finish(job, status, index, job.slot);
+  s->prof.finish += nowUs() - finishUs;
 }
 
 void AppleD5500UserClient::drain() {
@@ -739,10 +771,25 @@ void AppleD5500UserClient::drain() {
   IOLockUnlock(s->lock);
 }
 
+static void printProfile(const Session *s) {
+  const Profile &p = s->prof;
+  if (!p.frames) return;
+  const unsigned long long n = p.frames;
+  // two lines: the kernel's printf cuts a line at about 230 characters
+  printf("rk3588-vdec: d5500: profile of %llu frames, microseconds per frame: queue %llu, prepare %llu, core %llu, finish %llu\n", n, static_cast<unsigned long long>(p.queue / n),
+         static_cast<unsigned long long>(p.prep / n), static_cast<unsigned long long>(p.core / n), static_cast<unsigned long long>(p.finish / n));
+  printf("rk3588-vdec: d5500: profile, inside core: block %llu start to interrupt, %llu in the job runner (%llu jobs); picture callback %llu = flush %llu + copy %llu + flush %llu + probe %llu; rest %llu\n",
+         static_cast<unsigned long long>(p.blockRun / n), static_cast<unsigned long long>(p.blockWall / n), static_cast<unsigned long long>(p.blockJobs),
+         static_cast<unsigned long long>(p.pictureCb / n), static_cast<unsigned long long>(p.flushPre / n), static_cast<unsigned long long>(p.copy / n),
+         static_cast<unsigned long long>(p.flushPost / n), static_cast<unsigned long long>(p.probe / n),
+         static_cast<unsigned long long>((p.core - p.pictureCb - p.blockWall) / n));
+}
+
 void AppleD5500UserClient::tearDownDecoder() {
   Session *s = session;
   if (!s->core) return;
   drain();
+  printProfile(s);
   vdec_core_destroy(s->core);
   s->core = nullptr;
   if (s->scratch) {
@@ -927,6 +974,7 @@ IOReturn AppleD5500UserClient::externalMethod(uint32_t selector, IOExternalMetho
         out[0x88 / 4] = 1;
         return kIOReturnSuccess;
       }
+      job.queuedUs = nowUs();
       s->queue[(s->head + s->count) % kQueueDepth] = job;
       ++s->count;
       IOLockWakeup(s->lock, &s->event[0], true);

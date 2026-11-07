@@ -414,13 +414,16 @@ bool selfTest(unsigned passes) {
 struct CoreMeter {
   uint64_t jobs, totalUs, worstUs;
   unsigned jobErrors, lastStatus;
+  uint64_t wallUs;   // the time inside coreRun (register writes, the wait, the status read), against totalUs (start to interrupt)
 };
+CoreMeter gClientMeter;   // the one of rk3588_vdec_hw (the user client's)
 
 // VdecHw::run: the registers go to the block, the interrupt is awaited. 0 when the block answered; the status says whether it was happy.
 int coreRun(void *ctx, const uint32_t *regs, const VdecRun *runs, unsigned nRuns, uint32_t *status) {
   noteStack();
   CoreMeter *meter = static_cast<CoreMeter *>(ctx);
   const vdec::Hw hw = blockHw();
+  const uint64_t wallStart = nowUs();
   uint64_t us = 0;
   const bool done = vdec::executeJob(hw, regs, nRuns, [&](unsigned i, uint32_t *first, uint32_t *count) {
     *first = runs[i].first;
@@ -446,21 +449,27 @@ int coreRun(void *ctx, const uint32_t *regs, const VdecRun *runs, unsigned nRuns
     resetCore();
   }
   meter->totalUs += us;
+  meter->wallUs += nowUs() - wallStart;
   if (us > meter->worstUs) meter->worstUs = us;
   return 0;
 }
 
 // The block for a user client (Rk3588VdecD5500.cpp): the window and the job runner, with a meter of its own that nobody reads.
 extern "C" int rk3588_vdec_hw(struct VdecHw *hw) {
-  static CoreMeter meter;
   if (!hw || !gDma) return 0;
   *hw = VdecHw();
-  hw->ctx = &meter;
+  hw->ctx = &gClientMeter;
   hw->dmaVirt = gDma;
   hw->dmaBus = rk3588_vdec_config.dma_phys;
   hw->dmaBytes = rk3588_vdec_config.dma_bytes;
   hw->run = coreRun;
   return 1;
+}
+
+extern "C" void rk3588_vdec_block_stats(uint64_t *jobs, uint64_t *runUs, uint64_t *wallUs) {
+  *jobs = gClientMeter.jobs;
+  *runUs = gClientMeter.totalUs;
+  *wallUs = gClientMeter.wallUs;
 }
 
 struct CoreCheck {

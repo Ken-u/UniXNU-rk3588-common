@@ -67,6 +67,14 @@ static uint64_t now_ms(void)
    return mach_absolute_time() * tb.numer / tb.denom / 1000000;
 }
 
+static uint64_t now_us(void)
+{
+   static mach_timebase_info_data_t tb;
+   if (!tb.denom)
+      mach_timebase_info(&tb);
+   return mach_absolute_time() * tb.numer / tb.denom / 1000;
+}
+
 static uint32_t crc32_update(uint32_t crc, const uint8_t *p, size_t n)
 {
    static uint32_t table[256];
@@ -167,12 +175,14 @@ struct result {
    uint32_t width, height;
    OSType format;
    int surfaceBacked;
+   uint64_t copyUs, crcUs, sayUs, firstUs, lastUs;   /* time copying a picture out of its IOSurface, in the CRC of the copy and in the log line of the callback; when the first and the last picture came out (since the first frame went in) */
 };
 
 static struct result gResult;
+static uint64_t gSubmitUs;   /* when the first frame of the session went in */
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 
-static uint32_t picture_crc(CVPixelBufferRef pixels, uint32_t *w, uint32_t *h, OSType *fmt, int *iosurface)
+static uint32_t picture_crc(CVPixelBufferRef pixels, uint32_t *w, uint32_t *h, OSType *fmt, int *iosurface, uint64_t *copyUs)
 {
    *w = (uint32_t)CVPixelBufferGetWidth(pixels);
    *h = (uint32_t)CVPixelBufferGetHeight(pixels);
@@ -186,10 +196,29 @@ static uint32_t picture_crc(CVPixelBufferRef pixels, uint32_t *w, uint32_t *h, O
       size_t lumaStride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 0);
       const uint8_t *chroma = CVPixelBufferGetBaseAddressOfPlane(pixels, 1);
       size_t chromaStride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 1);
-      for (uint32_t y = 0; y < *h; ++y)
-         crc = crc32_update(crc, luma + y * lumaStride, *w);
-      for (uint32_t y = 0; y < *h / 2; ++y)
-         crc = crc32_update(crc, chroma + y * chromaStride, *w);
+      /* Copy the rows out first (memcpy, wide loads) and sum the copy: the surface's pages are mapped
+         write-combined, and reading them byte by byte costs about 100 ns a byte (80 times more than
+         memcpy), which the first timing runs of this tool measured instead of the decoder. */
+      static uint8_t *copy;
+      static size_t copyBytes;
+      const size_t need = (size_t)*w * *h * 3 / 2;
+      if (copyBytes < need) {
+         free(copy);
+         copy = malloc(need);
+         copyBytes = copy ? need : 0;
+      }
+      if (!copy) {
+         CVPixelBufferUnlockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly);
+         return 0xdeadbeef;
+      }
+      const uint64_t t0 = now_us();
+      uint8_t *out = copy;
+      for (uint32_t y = 0; y < *h; ++y, out += *w)
+         memcpy(out, luma + y * lumaStride, *w);
+      for (uint32_t y = 0; y < *h / 2; ++y, out += *w)
+         memcpy(out, chroma + y * chromaStride, *w);
+      *copyUs += now_us() - t0;
+      crc = crc32_update(crc, copy, need);
    } else {
       crc = 0xbad0bad0;
    }
@@ -211,7 +240,10 @@ static void decoded(void *refcon, void *frameRefcon, OSStatus status, VTDecodeIn
    uint32_t w, h;
    OSType fmt;
    int surface;
-   uint32_t crc = picture_crc(image, &w, &h, &fmt, &surface);
+   uint64_t copyUs = 0;
+   const uint64_t crcStart = now_us();
+   uint32_t crc = picture_crc(image, &w, &h, &fmt, &surface, &copyUs);
+   const uint64_t crcEnd = now_us();
    pthread_mutex_lock(&gLock);
    uint32_t slot = gResult.outputs;
    if (slot < MAX_UNITS) {
@@ -225,6 +257,13 @@ static void decoded(void *refcon, void *frameRefcon, OSStatus status, VTDecodeIn
    pthread_mutex_unlock(&gLock);
    say("vt:   output %u: frame %lu pts %lld %ux%u format '%c%c%c%c' IOSurface %d crc %08x", slot, (unsigned long)index, (long long)pts.value, w, h,
        (char)(fmt >> 24), (char)(fmt >> 16), (char)(fmt >> 8), (char)fmt, surface, crc);
+   const uint64_t sayEnd = now_us();
+   gResult.copyUs += copyUs;
+   gResult.crcUs += crcEnd - crcStart - copyUs;
+   gResult.sayUs += sayEnd - crcEnd;
+   if (!gResult.firstUs)
+      gResult.firstUs = crcStart - gSubmitUs + 1;
+   gResult.lastUs = sayEnd - gSubmitUs;
    __atomic_fetch_add(&gResult.outputs, 1, __ATOMIC_SEQ_CST);
 }
 
@@ -298,6 +337,7 @@ static int run_stream(const struct VtStream *stream, int requireHardware)
    memset(&gResult, 0, sizeof gResult);
    int failures = 0;
    t0 = now_ms();
+   gSubmitUs = now_us();
    for (uint32_t u = 0; u < parsed->unitCount; ++u) {
       const struct unit *unit = &parsed->units[u];
       size_t total = 0;
@@ -342,11 +382,14 @@ static int run_stream(const struct VtStream *stream, int requireHardware)
    }
    status = VTDecompressionSessionFinishDelayedFrames(session);
    say("vt: %s: FinishDelayedFrames: %d", stream->name, (int)status);
-   for (int waited = 0; gResult.outputs < parsed->unitCount && waited < 300; ++waited)
-      usleep(100 * 1000);
+   for (int waited = 0; gResult.outputs < parsed->unitCount && waited < 15000; ++waited)
+      usleep(2 * 1000);
    status = VTDecompressionSessionWaitForAsynchronousFrames(session);
    say("vt: %s: WaitForAsynchronousFrames: %d, %u of %u pictures out in %llu ms", stream->name, (int)status, gResult.outputs, parsed->unitCount,
        (unsigned long long)(now_ms() - t0));
+   say("vt: %s: timing: first picture %llu us after the first frame went in, last %llu us; in the callbacks: copy out of the surface %llu us, CRC of the copy %llu us, log line %llu us (all pictures)", stream->name,
+       (unsigned long long)gResult.firstUs, (unsigned long long)gResult.lastUs, (unsigned long long)gResult.copyUs, (unsigned long long)gResult.crcUs,
+       (unsigned long long)gResult.sayUs);
 
    /* The expected CRCs are in display order, the output order is the session's: compare as sets. */
    unsigned matched = 0;
