@@ -96,10 +96,13 @@ constexpr uint32_t soft(unsigned n) { return 0xa00 + 4 * n; }
 // CLKSEL_CON(91): [5] mux and [4:0] divider of clk_rkvdec0_core
 // CLKGATE_CON(40): 0 hclk_rkvdec0_root, 1 aclk_rkvdec0_root, 2 aclk_rkvdec_ccu, 3 hclk_rkvdec0, 4 aclk_rkvdec0, 7 ca, 8 hevc_ca, 9 core
 // CLKGATE_CON(44): 0 aclk_vdpu_root, 1 aclk_vdpu_low_root, 2 hclk_vdpu_root
-// SOFTRST_CON(20): 1 A_CCU, 2 H_RKVDEC0, 3 A_RKVDEC0, 4 H_BIU, 5 A_BIU, 6 CA, 7 HEVC_CA, 8 CORE (ids 321..328)
-constexpr uint32_t kGateDec = gate(40), kGateVdpu = gate(44), kSoftDec = soft(20);
+// SOFTRST_CON(40) (the vendor header's ids 642..649 = 16 * 40 + 2..9; the first version of this driver read ids 321..328 of another numbering as CON(20), where
+// bits 2, 3, 6, 7 and 8 are the reset lines of the DDR controller: asserting them stopped the whole board): 2 A_CCU, 3 H_RKVDEC0, 4 A_RKVDEC0, 5 H_BIU, 6 A_BIU,
+// 7 CA, 8 HEVC_CA, 9 CORE
+constexpr uint32_t kGateDec = gate(40), kGateVdpu = gate(44), kSoftDec = soft(40);
 constexpr uint32_t kGateDecAll = 0x39f, kGateVdpuAll = 0x7;        // the bits above that must be 0
-constexpr uint32_t kSoftDecAll = 0x1fe, kSoftDecCore = 1u << 2 | 1u << 3 | 1u << 6 | 1u << 7 | 1u << 8;   // everything, and what the vendor driver resets
+// everything, and what the vendor driver resets (video_h, video_a, video_cabac, video_hevc_cabac, video_core)
+constexpr uint32_t kSoftDecAll = 0x3fc, kSoftDecCore = 1u << 3 | 1u << 4 | 1u << 7 | 1u << 8 | 1u << 9;
 struct Pll {
   const char *name;
   unsigned con;
@@ -242,7 +245,7 @@ bool domainOn(const Domain &d) {
 }
 
 void lookPower() {
-  printf("rk3588-vdec: cru: gate40 %#x gate44 %#x soft20 %#x sel89 %#x sel90 %#x sel91 %#x sel98 %#x\n", cru(kGateDec), cru(kGateVdpu), cru(kSoftDec), cru(sel(89)),
+  printf("rk3588-vdec: cru: gate40 %#x gate44 %#x soft40 %#x sel89 %#x sel90 %#x sel91 %#x sel98 %#x\n", cru(kGateDec), cru(kGateVdpu), cru(kSoftDec), cru(sel(89)),
          cru(sel(90)), cru(sel(91)), cru(sel(98)));
   for (const Pll &p : kPlls) printf("rk3588-vdec: %s %llu kHz%s\n", p.name, static_cast<unsigned long long>(pllKHz(p.con)), (cru(4 * p.con + 24) & (1u << 15)) ? "" : " (not locked)");
   for (const Domain *d : kLook) printDomain(*d);
@@ -272,10 +275,12 @@ bool setClocks() {
   return true;
 }
 
-// The five resets the vendor driver pulses (video_a, video_h, video_core, video_cabac, video_hevc_cabac).
+// The five resets the vendor driver pulses (video_a, video_h, video_core, video_cabac, video_hevc_cabac: rkvdec2_reset in mpp_rkvdec2.c): all asserted,
+// 5 us, all released. The vendor driver asks the PMU for an idle bus interface first only where the device tree does not say `rockchip,skip-pmu-idle-request`,
+// and the RK3588's does.
 void resetCore() {
   cruWrite(kSoftDec, kSoftDecCore, kSoftDecCore);
-  IODelay(20);
+  IODelay(5);
   cruWrite(kSoftDec, kSoftDecCore, 0);
   IODelay(20);
 }
@@ -287,10 +292,10 @@ bool powerUp() {
   }
   for (const Domain *d : kPowerOrder)
     if (!domainOn(*d)) return false;
-  printf("rk3588-vdec: reset lines before: soft20 %#x\n", cru(kSoftDec));
+  printf("rk3588-vdec: reset lines before: soft40 %#x\n", cru(kSoftDec));
   cruWrite(kSoftDec, kSoftDecAll, 0);   // everything out of reset
   IODelay(20);
-  printf("rk3588-vdec: reset lines after: soft20 %#x, gate40 %#x\n", cru(kSoftDec), cru(kGateDec));
+  printf("rk3588-vdec: reset lines after: soft40 %#x, gate40 %#x\n", cru(kSoftDec), cru(kGateDec));
   return true;
 }
 
@@ -349,7 +354,8 @@ void dumpPicture(const uint8_t *p, uint32_t len) {
 }
 
 // One trace, `passes` times over. Returns false on the first job that fails (the jobs depend on each other).
-bool runTrace(const char *name, const unsigned char *data, size_t size, unsigned passes) {
+// `sabotage` (rk3588-vdec-reset-test): the expected CRC of the first job is wrong on purpose, to walk the recovery path (resetCore) without a real failure.
+bool runTrace(const char *name, const unsigned char *data, size_t size, unsigned passes, bool sabotage = false) {
   vdec::Trace trace;
   if (!trace.parse(data, size)) {
     printf("rk3588-vdec: %s: the trace is not usable: %s\n", name, trace.error());
@@ -374,6 +380,7 @@ bool runTrace(const char *name, const unsigned char *data, size_t size, unsigned
         return false;
       }
       vdec::JobResult r;
+      if (sabotage && n == 0) job.outCrc ^= 1;
       const bool ok = player.run(job, 2000000, &r);
       if (pass == 0 || !ok)
         printf("rk3588-vdec: %s: job %u: %s status %#x %llu us crc %#x expected %#x: %s\n", name, n, r.done ? "done" : "TIMEOUT", r.status,
@@ -582,6 +589,13 @@ void vdecThread(void *, wait_result_t) {
   if (gMode != 6) selfTest(gMode == 4 ? passes : 1);
   if (gMode >= 5) coreTest(gMode == 6 ? passes : 1, chunk);
   lookBlock();
+  if (bootArg("rk3588-vdec-reset-test", 0)) {   // last, so that a recovery that wedges the board costs nothing else
+    printf("rk3588-vdec: reset test: a job that fails on purpose, the recovery, then the traces again\n");
+    runTrace(kVdecTraces[0].name, kVdecTraces[0].data, kVdecTraces[0].size, 1, true);
+    printf("rk3588-vdec: reset test: the recovery returned\n");
+    IOSleep(60);
+    selfTest(1);
+  }
 }
 
 }  // namespace
