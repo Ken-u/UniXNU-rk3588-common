@@ -182,6 +182,23 @@ void vdec_core_stats(const VdecCore *core, VdecStats *stats) {
   vdec_shim_window_stats(NULL, NULL, &stats->windowPeakBytes);
 }
 
+// What the sinks are told about a frame of the slot table (valid while the buffer is held).
+static void fill_picture(VdecPicture *pic, MppFrame frame, MppBuffer buf) {
+  memset(pic, 0, sizeof *pic);
+  pic->data = (const uint8_t *)mpp_buffer_get_ptr(buf);
+  pic->bytes = (uint32_t)mpp_buffer_get_size(buf);
+  pic->width = mpp_frame_get_width(frame);
+  pic->height = mpp_frame_get_height(frame);
+  pic->hstride = mpp_frame_get_hor_stride(frame);
+  pic->vstride = mpp_frame_get_ver_stride(frame);
+  pic->cropLeft = mpp_frame_get_offset_x(frame);
+  pic->cropTop = mpp_frame_get_offset_y(frame);
+  pic->pts = mpp_frame_get_pts(frame);
+  pic->poc = mpp_frame_get_poc(frame);
+  if (mpp_frame_get_errinfo(frame)) pic->flags |= kVdecPicError;
+  if (mpp_frame_get_discard(frame)) pic->flags |= kVdecPicDiscard;
+}
+
 // the pictures that are ready, in display order (mpp_dec_push_display + mpp_dec_put_frame)
 static int push_display(VdecCore *core, HalDecTaskFlag flags, const VdecSink *sink) {
   MppBufSlots slots = core->frameSlots;
@@ -200,20 +217,8 @@ static int push_display(VdecCore *core, HalDecTaskFlag flags, const VdecSink *si
     buf = frame ? mpp_frame_get_buffer(frame) : NULL;
     if (frame && buf && sink && sink->picture) {
       VdecPicture pic;
-      memset(&pic, 0, sizeof pic);
-      pic.data = (const uint8_t *)mpp_buffer_get_ptr(buf);
-      pic.bytes = (uint32_t)mpp_buffer_get_size(buf);
-      pic.width = mpp_frame_get_width(frame);
-      pic.height = mpp_frame_get_height(frame);
-      pic.hstride = mpp_frame_get_hor_stride(frame);
-      pic.vstride = mpp_frame_get_ver_stride(frame);
-      pic.cropLeft = mpp_frame_get_offset_x(frame);
-      pic.cropTop = mpp_frame_get_offset_y(frame);
-      pic.pts = mpp_frame_get_pts(frame);
-      pic.poc = mpp_frame_get_poc(frame);
+      fill_picture(&pic, frame, buf);
       if (last) pic.flags |= kVdecPicEos;
-      if (mpp_frame_get_errinfo(frame)) pic.flags |= kVdecPicError;
-      if (mpp_frame_get_discard(frame)) pic.flags |= kVdecPicDiscard;
       if (last && error) pic.flags |= refer ? kVdecPicError : kVdecPicDiscard;
       sink->picture(sink->ctx, &pic);
     }
@@ -312,6 +317,18 @@ static int run_task(VdecCore *core, const VdecSink *sink) {
   mpp_hal_hw_start(core->hal, task);
   mpp_hal_hw_wait(core->hal, task);
   core->stats.jobs++;
+
+  // the picture of this job, decode order, before anything else can touch the window
+  if (sink && sink->decoded && dec->output >= 0) {
+    MppFrame frame = NULL;
+    mpp_buf_slot_get_prop(frameSlots, dec->output, SLOT_FRAME_PTR, &frame);
+    if (frame && bufOut) {
+      VdecPicture pic;
+      fill_picture(&pic, frame, bufOut);
+      if (dec->flags.parse_err || dec->flags.ref_err) pic.flags |= kVdecPicError;
+      sink->decoded(sink->ctx, &pic);
+    }
+  }
 
   // 12. the block is done with the stream, the picture and its references
   mpp_buf_slot_clr_flag(packetSlots, dec->input, SLOT_HAL_INPUT);

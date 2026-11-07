@@ -2,9 +2,11 @@
  * VideoToolbox test of the rkvdec2 video decoder: the first user task that asks iPadOS's own decoder stack for H.264 pictures and compares what
  * comes back with the CRC-32 of each picture the host decoder produced (the .crc files of streams/).
  *
- * It is the init process of the board when boot-arg evb10-exec=1 (UniXNU-evb10 patches/xnu/evb10-userland-mounts.patch; the kernel writes it to
- * /private/var/evb10 from the file list Rk3588Vdec.cpp gives it, vdec_test_file). Nothing else is running, the output goes to /dev/console, which
- * is the serial line. It never exits (an exiting init panics the kernel): after the last line it sleeps.
+ * It runs as launchd's job com.apple.ptpd when boot-arg evb10-exec=2 (UniXNU-orangepi5 patches/xnu/opi5-launchd-test.patch: the kernel writes it to
+ * /private/var/evb10/launchd from the file list Rk3588Vdec.cpp gives it, vdec_test_file, and union-mounts that directory over /usr/libexec, so it shadows the
+ * sealed /usr/libexec/ptpd). VideoToolbox needs launchd's bootstrap port; as the init process (evb10-exec=1) it cannot create a decoder session. The output
+ * goes to /dev/console, which is the serial line. It never exits after the last pass (launchd would restart it): it sleeps.
+ * It runs 16 passes (the first right after boot, then after 60 s, then every 30 s) because the failures this test found appeared minutes after boot.
  *
  *   1. IOKit: is there an AppleD5500 service (what AppleD5500OpenConnection of H264H8.videodecoder looks for), and does IOServiceOpen(type 1) work?
  *   2. VTIsHardwareDecodeSupported(H.264).
@@ -271,8 +273,14 @@ static int run_stream(const struct VtStream *stream, int requireHardware)
    VTDecompressionOutputCallbackRecord callback = {decoded, NULL};
    VTDecompressionSessionRef session = NULL;
    uint64_t t0 = now_ms();
-   status = VTDecompressionSessionCreate(kCFAllocatorDefault, format, spec, attributes, &callback, &session);
-   say("vt: %s: VTDecompressionSessionCreate: %d (%llu ms)", stream->name, (int)status, (unsigned long long)(now_ms() - t0));
+   /* the first session of the boot starts videocodecd, which was seen to be killed while it started (-12911, malfunction): ask again */
+   for (unsigned attempt = 0; attempt < 3; ++attempt) {
+      status = VTDecompressionSessionCreate(kCFAllocatorDefault, format, spec, attributes, &callback, &session);
+      say("vt: %s: VTDecompressionSessionCreate: %d (%llu ms)", stream->name, (int)status, (unsigned long long)(now_ms() - t0));
+      if (status != -12911)
+         break;
+      sleep(2);
+   }
    CFRelease(spec);
    CFRelease(attributes);
    if (status != noErr || !session) {
@@ -389,15 +397,23 @@ int main(void)
    int fd = open("/dev/console", O_WRONLY);
    if (fd >= 0)
       console = fd;
-   say("vt: VideoToolbox test of the rkvdec2 decoder, pid %d uid %d", getpid(), getuid());
-   probe_service();
-   say("vt: VTIsHardwareDecodeSupported(H.264): %d, (HEVC): %d", VTIsHardwareDecodeSupported(kCMVideoCodecType_H264),
-       VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC));
-   unsigned failed = 0;
-   for (unsigned round = 0; round < 2; ++round)
-      for (unsigned i = 0; i < kVtStreamCount; ++i)
-         failed += run_stream(&kVtStreams[i], (int)round) != 0;
-   say("vt: done, %u stream run(s) failed", failed);
+   int init = getpid() == 1;
+   say("vt: VideoToolbox test of the rkvdec2 decoder, pid %d uid %d (%s)", getpid(), getuid(), init ? "the init process" : "a job of launchd");
+   /* As a job of launchd the test runs sixteen times, the first ones as the system comes up (services VideoToolbox needs may not be there at the first), the
+    * rest while the system has been busy for a while: sessions that went wrong at random came out of the system's state of some minutes. */
+   for (unsigned pass = 0; pass < (init ? 1u : 16u); ++pass) {
+      if (pass)
+         sleep(pass == 1 ? 60 : 30);
+      say("vt: pass %u", pass);
+      probe_service();
+      say("vt: VTIsHardwareDecodeSupported(H.264): %d, (HEVC): %d", VTIsHardwareDecodeSupported(kCMVideoCodecType_H264),
+          VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC));
+      unsigned failed = 0;
+      for (unsigned round = 0; round < 2; ++round)
+         for (unsigned i = 0; i < kVtStreamCount; ++i)
+            failed += run_stream(&kVtStreams[i], (int)round) != 0;
+      say("vt: pass %u done, %u stream run(s) failed", pass, failed);
+   }
    for (;;)
       sleep(1000);
 }

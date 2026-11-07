@@ -43,14 +43,14 @@ void vdc_log(int level, const char *line) { printf("rk3588-vdec: [mpp %d] %s\n",
 }
 
 // The test program for boot-arg evb10-exec=1: the kernel's list of test files (mali_test_file, package/Mali) ends with this one. Without a Mali driver in the
-// kernel, a weak mali_test_file of the board's own can call this. Index 0 is the program the kernel starts as init.
+// kernel, a weak mali_test_file of the board's own can call this. Index 0 is the program: the kernel starts it as init (evb10-exec=1) or launchd starts it in place of the job com.apple.ptpd (evb10-exec=2).
 extern "C" int vdec_test_file(unsigned index, const char **name, const uint8_t **data, size_t *size, size_t *rawSize) {
 #if VDEC_TEST_FILE
-  if (index != 0) return -1;
-  *name = kVdecTestFileName;
-  *data = kVdecTestFileData;
-  *size = sizeof kVdecTestFileData;
-  *rawSize = kVdecTestFileRaw;
+  if (index >= sizeof kVdecTestFiles / sizeof kVdecTestFiles[0]) return -1;
+  *name = kVdecTestFiles[index].name;
+  *data = kVdecTestFiles[index].data;
+  *size = kVdecTestFiles[index].size;
+  *rawSize = kVdecTestFiles[index].raw;
   return 0;
 #else
   (void)index; (void)name; (void)data; (void)size; (void)rawSize;
@@ -434,9 +434,33 @@ int coreRun(void *ctx, const uint32_t *regs, const VdecRun *runs, unsigned nRuns
     resetCore();   // the vendor driver's recovery
     return -1;
   }
+  if (*status & vdec::kStaErrorMask) {
+    // An interrupt with an error bit (the stream is damaged, a buffer ran empty): the block stays in that state for every job after it (all pictures come out
+    // flagged as errors, whatever the input) until it is reset; the vendor driver resets it after such an interrupt.
+    static unsigned logged;
+    if (logged < 24) {
+      ++logged;
+      printf("rk3588-vdec: job %llu: the block reports an error, status %#x after %llu us: resetting it\n", static_cast<unsigned long long>(meter->jobs), *status,
+             static_cast<unsigned long long>(us));
+    }
+    resetCore();
+  }
   meter->totalUs += us;
   if (us > meter->worstUs) meter->worstUs = us;
   return 0;
+}
+
+// The block for a user client (Rk3588VdecD5500.cpp): the window and the job runner, with a meter of its own that nobody reads.
+extern "C" int rk3588_vdec_hw(struct VdecHw *hw) {
+  static CoreMeter meter;
+  if (!hw || !gDma) return 0;
+  *hw = VdecHw();
+  hw->ctx = &meter;
+  hw->dmaVirt = gDma;
+  hw->dmaBus = rk3588_vdec_config.dma_phys;
+  hw->dmaBytes = rk3588_vdec_config.dma_bytes;
+  hw->run = coreRun;
+  return 1;
 }
 
 struct CoreCheck {
@@ -485,7 +509,7 @@ bool runStream(const char *name, const unsigned char *data, size_t size, const u
       return false;
     }
     CoreCheck check = {crcs, crcCount, 0, 0, 0, pass == 0};
-    const VdecSink sink = {&check, corePicture};
+    const VdecSink sink = {&check, corePicture, nullptr};
     const uint64_t startUs = nowUs();
     bool failed = false;
     for (size_t at = 0; at < size && !failed;) {
@@ -536,6 +560,10 @@ void vdecThread(void *, wait_result_t) {
   if (gMode < 2) return;
   if (!powerUp()) return;
   lookBlock();
+  if (gMode == 7) {
+    rk3588_vdec_serve();
+    return;
+  }
   if (gMode < 3) return;
   const unsigned passes = bootArg("rk3588-vdec-passes", 20), chunk = bootArg("rk3588-vdec-chunk", 0);
   if (gMode != 6) selfTest(gMode == 4 ? passes : 1);

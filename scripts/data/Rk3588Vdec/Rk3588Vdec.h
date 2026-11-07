@@ -22,6 +22,8 @@
 // 2 also power the domains on, set the clocks, release the resets and read the block's identification and IOMMU registers;
 // 3 also replay every embedded trace once and compare the pictures; 4 as 3, repeated rk3588-vdec-passes=N times (default 20) for timing;
 // 5 as 3, then every embedded H.264 stream through the decoder core, once; 6 only the decoder core, rk3588-vdec-passes=N times.
+// 7 powers the block on (as 2) and registers the AppleD5500 service (Rk3588VdecD5500.cpp): VideoToolbox's H.264 decoder plug-in finds it, opens a user client and
+// decodes through the decoder core; rk3588-vdec-d5500-log=N is how much of that traffic is printed (default 1).
 // rk3588-vdec-dump=1 hex-dumps the output picture of the first job that does not match. rk3588-vdec-chunk=N feeds the streams to the decoder core in
 // pieces of N bytes (default: whole); rk3588-vdec-mpp-log=N is how loud MPP's own messages are (1 fatal .. 6 verbose, default 3).
 #pragma once
@@ -40,6 +42,14 @@ extern const struct Rk3588VdecConfig rk3588_vdec_config;
 
 // Called by the board's probe once the kernel is up; reads the boot arguments and returns at once without rk3588-vdec=N.
 void rk3588_vdec_start(void);
+
+struct VdecHw;
+// Fills in the block as the decoder core (core/VdecCore.h) wants it: the DMA window and the job runner. Non-zero when the driver has the block powered and
+// mapped (rk3588-vdec=2 and up). Only one core may use it at a time.
+int rk3588_vdec_hw(struct VdecHw *hw);
+
+// Rk3588VdecD5500.cpp: makes and registers the AppleD5500 service (once IOKit is up; called from the driver's thread).
+void rk3588_vdec_serve(void);
 
 #ifdef __cplusplus
 }

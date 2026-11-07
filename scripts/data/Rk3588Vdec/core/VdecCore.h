@@ -69,7 +69,10 @@ typedef struct VdecPicture {
 
 typedef struct VdecSink {
   void *ctx;
-  void (*picture)(void *ctx, const VdecPicture *pic);   // the pixels are only valid during the call
+  void (*picture)(void *ctx, const VdecPicture *pic);   // display order; the pixels are only valid during the call
+  // Optional, decode order: the picture a job has just made, before the next job can touch the window (what a client that reorders pictures itself, like
+  // VideoToolbox, wants). `pts` is the one given to vdec_core_decode with the bytes that held the picture's slices. Called once per job.
+  void (*decoded)(void *ctx, const VdecPicture *pic);
 } VdecSink;
 
 typedef struct VdecStats {
