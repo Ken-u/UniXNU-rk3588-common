@@ -253,7 +253,7 @@ static void testStream(const std::string &streamPath, const std::string &tracePa
   VdecJobObserver obs = {&h, Harness::before, Harness::after};
   vdec_core_set_observer(core, &obs);
   Pictures pics{&h, {}, {}};
-  VdecSink sink = {&pics, Pictures::sink};
+  VdecSink sink = {&pics, Pictures::sink, nullptr};
   int n = 0;
   for (size_t at = 0; at < stream.size();) {
     size_t len = chunk ? std::min(chunk, stream.size() - at) : stream.size();
