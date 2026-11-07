@@ -52,6 +52,7 @@ static int g_verbose = 0;
 
 // ---- platform hooks of the core
 static long g_live = 0;
+static long g_baseline = -1;   // live allocations after the first pass over all streams
 extern "C" void *vdc_calloc(size_t size) {
   ++g_live;
   return calloc(1, size);
@@ -276,11 +277,11 @@ static void testStream(const std::string &streamPath, const std::string &tracePa
   }
   printf("  %u jobs, %u pictures, window peak %u KiB\n", st.jobs, st.pictures, st.windowPeakBytes >> 10);
   vdec_core_destroy(core);
-  // MPP keeps a few pools (frames, packets, meta) for the life of the process, created on first use: after the first stream the number of live allocations
-  // must not move any more, whatever is decoded and however often a core is made and destroyed.
-  static long baseline = -1;
-  if (baseline < 0) baseline = g_live;
-  CHECKF(g_live == baseline, "%ld allocations live after this stream, %ld after the first", g_live, baseline);
+  // MPP keeps a few pools (frames, packets, meta) for the life of the process, created on first use and as large as the most pictures any stream had in
+  // flight at one time (a stream with more reference pictures or a deeper reordering makes the frame pool two entries bigger: 280 bytes each, from
+  // mpp_frame_init). So the count is allowed to grow during the first pass over the streams (the first piece size, every stream once); from then on the
+  // number of live allocations must not move any more, whatever is decoded and however often a core is made and destroyed.
+  if (g_baseline >= 0) CHECKF(g_live == g_baseline, "%ld allocations live after this stream, %ld after the first pass", g_live, g_baseline);
 }
 
 int main(int argc, char **argv) {
@@ -295,8 +296,10 @@ int main(int argc, char **argv) {
     printf("usage: test-core [-v] STREAM TRACE CRCS ...\n");
     return 2;
   }
-  for (size_t chunk : {size_t(0), size_t(4093), size_t(1000), size_t(7)})
+  for (size_t chunk : {size_t(0), size_t(4093), size_t(1000), size_t(7)}) {
     for (int i = first; i + 2 < argc; i += 3) testStream(argv[i], argv[i + 1], argv[i + 2], chunk);
+    if (g_baseline < 0) g_baseline = g_live;
+  }
   printf("%d checks, %d failed\n", g_checks, g_fail);
   return g_fail ? 1 : 0;
 }

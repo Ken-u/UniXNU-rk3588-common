@@ -10,7 +10,9 @@ c++ -std=c++17 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -I"$her
 args=
 for s in "$here"/../streams/*.h264; do
   n=$(basename "$s" .h264)
-  args="$args $s $here/../traces/mpp-nt/$n.vdt $here/../streams/$n.crc"
+  crc="$here/../streams/$n.crc"
+  [ -f "$here/../streams/$n.coded.crc" ] && crc="$here/../streams/$n.coded.crc"   # a cropped stream: the job chain is checked against the whole coded pictures
+  args="$args $s $here/../traces/mpp-nt/$n.vdt $crc"
 done
 # shellcheck disable=SC2086
 "$out/test-core" "$@" $args

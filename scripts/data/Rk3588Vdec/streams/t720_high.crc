@@ -1,0 +1,11 @@
+# CRC-32 of each decoded picture (NV12, 1280x720), display order: libavc 4275faf (equal to the encoder's own reconstruction), the reference of traces/t720_high.vdt
+d92a883c
+15932bf9
+1507173f
+f0e488fb
+c53ab333
+7928ba6e
+647c5b72
+68dbe49c
+94c58be3
+446e649f

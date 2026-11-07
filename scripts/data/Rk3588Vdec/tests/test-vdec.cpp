@@ -421,7 +421,7 @@ static void testRealTrace(const char *path) {
   if (!ok) return;
   printf("%s: %ux%u, %u jobs, %u buffers, window %u bytes\n", path, trace.width(), trace.height(), trace.jobCount(), trace.bufCount(), trace.windowBytes());
   CHECK(trace.width() > 0 && trace.height() > 0 && trace.jobCount() > 0);
-  CHECK(trace.windowBytes() <= 16u << 20);
+  CHECK(trace.windowBytes() <= 64u << 20);   // the board window (UniXNU-orangepi5 package/Rk3588VdecBoard.cpp)
   size_t cursor = 0;
   Job j;
   for (unsigned n = 0; n < trace.jobCount(); ++n) {

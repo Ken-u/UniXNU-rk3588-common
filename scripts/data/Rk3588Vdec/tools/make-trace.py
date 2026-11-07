@@ -39,6 +39,8 @@ def main():
     ap.add_argument('--height', type=int, required=True)
     ap.add_argument('--jobs', type=int, required=True, help='number of jobs to keep (= frames, no B frames)')
     ap.add_argument('--out', required=True, help='output path without extension')
+    ap.add_argument('--mpp-size', help='WxH of the pictures in --mpp-out when MPP wrote only the visible part of a cropped picture (the cropping must start at 0,0: the '
+                                       'marker is in the first eight bytes of the coded picture); default: the coded size')
     ap.add_argument('--mpp-out', help='the pictures MPP handed out (NV12, display order) with the shim\'s job marker in their first eight bytes; without it the '
                                       'jobs are taken to be in display order (no B pictures)')
     a = ap.parse_args()
@@ -58,8 +60,10 @@ def main():
     if a.mpp_out:
         pics = open(a.mpp_out, 'rb').read()
         position = {}
-        for d in range(len(pics) // frame_size):
-            m = pics[d * frame_size:d * frame_size + 8]
+        mw, mh = (int(v) for v in a.mpp_size.split('x')) if a.mpp_size else (w, h)
+        mframe = mw * mh * 3 // 2
+        for d in range(len(pics) // mframe):
+            m = pics[d * mframe:d * mframe + 8]
             if m[:2] != b'JK' or m[6:8] != b'\xa5\x5a':
                 sys.exit('picture %d of %s carries no job marker' % (d, a.mpp_out))
             k = m[2] | m[3] << 8

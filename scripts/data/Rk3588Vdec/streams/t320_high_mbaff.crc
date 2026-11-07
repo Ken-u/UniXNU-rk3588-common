@@ -1,0 +1,11 @@
+# CRC-32 of each decoded picture (NV12, 320x256), display order: libavc 4275faf (equal to the encoder's own reconstruction), the reference of traces/t320_high_mbaff.vdt
+b213717e
+a11d8353
+8f4db842
+025a6c63
+d15c90fa
+afb23284
+20d991e7
+07d96ae1
+a5ebab86
+a1b8afe6

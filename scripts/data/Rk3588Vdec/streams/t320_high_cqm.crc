@@ -1,0 +1,11 @@
+# CRC-32 of each decoded picture (NV12, 320x240), display order: libavc 4275faf (equal to the encoder's own reconstruction), the reference of traces/t320_high_cqm.vdt
+0dcc2afc
+391324ac
+89203671
+4a4817f1
+c3a1eae9
+455fe633
+7ffc8f76
+19e89455
+37ba67a8
+3e227d80
