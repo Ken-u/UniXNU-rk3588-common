@@ -132,8 +132,8 @@ a real controller is a separate question: the board runs answer it (a device rep
 ## Video decoder (rkvdec2)
 
 `scripts/data/Rk3588Vdec/` brings up the RK3588 video decoder block (rkvdec2, "vdpu34x" in Rockchip's MPP; RKVDEC0 at `0xfdc30000`) from the kernel and replays recorded decode jobs
-on it, and (H.264 only) decodes embedded streams with Rockchip's own parser compiled into the kernel. It is the first step towards hardware H.264 / H.265 decoding for iPadOS and **has no user yet**:
-nothing in userland talks to it, and the only caller is a self-test. The device builds it with `build-rk3588-vdec.py <path>` (the kernel's compile record, `-Werror`, Mach-O audit; the archive embeds
+on it, and (H.264 only) decodes embedded streams with Rockchip's own parser compiled into the kernel. With `rk3588-vdec=7` it also presents the kernel service `AppleD5500` that iPadOS's own
+VideoToolbox H.264 hardware decoder opens, so **the only user is a test tool for now** (`usertest/`; no App, no H.265). The device builds it with `build-rk3588-vdec.py <path>` (the kernel's compile record, `-Werror`, Mach-O audit; the archive embeds
 `traces/*.vdt` and `streams/*.h264`), force-loads it and calls `rk3588_vdec_start()` from a probe.
 The board source defines `rk3588_vdec_config` (the physical address and size of a DMA window below 4 GiB; the block ran in IOMMU bypass, so buffers are addressed physically).
 
@@ -141,6 +141,8 @@ The board source defines `rk3588_vdec_config` (the physical address and size of 
 | --- | --- |
 | `VdecTrace.h` | The trace format (`VDT1`), its parser and the player: upload the CPU-written pages, copy the register image with the buffer addresses relocated into the window, clear the output region, write the cache registers, the register runs, then the start register, poll the interrupt register, compare the CRC-32 of the output. Plain C++ over a register accessor and one DMA window |
 | `Rk3588Vdec.cpp`, `Rk3588Vdec.h` | The kernel glue: PMU power domains (VCODEC, VDPU, RKVDEC0 in the vendor driver's order), the clocks (nearest PLL divisors at or below the vendor device tree's 800 / 600 / 1000 MHz), the resets, the mappings (the window through IOKit: the kernel's I/O submap is 8 MiB), the self-test thread |
+| `Rk3588VdecD5500.cpp` | The `AppleD5500` IOService and its user client (type 1, the eight selectors of the original kext's client: CreateDecoder, DestroyDecoder, DecodeFrameFig, MapPixelBuffer, UnmapPixelBuffer, SetCryptSession, one unnamed, SetCallback): the ring buffer and the output pictures are IOSurfaces found by id in `IOCoreSurfaceRoot`; the avcC extradata is parsed from the ring's first bytes; frames are queued to a thread of the client's own that runs the core one job at a time and copies each NV12 picture into the output slot's surface; completion is `sendAsyncResult64({sequence, status, record index})` plus a 0x410-byte result record in the ring. The interface is described in `UniXNU-orangepi5/docs/media.md` |
+| `usertest/` | `vt_test.c` (a VideoToolbox test: a hardware-required `VTDecompressionSession` per embedded stream, the CRC-32 of every returned NV12 picture compared with the reference list; 16 passes, run as launchd's job `com.apple.ptpd` with `evb10-exec=2`) and `build.sh` (clang, ad-hoc signed; its cdhash goes into the owner trust bundle) |
 | `core/` | The decoder core, plain C: MPP's H.264 parser (`h264d`) and `vdpu34x` register generator (29 files, **not copied**: `fetch_mpp.py` gets the commit pinned in `mpp.lock` and checks a tree hash) behind `MppShim.c` (a replacement for MPP's OS layer: memory, a first-fit buffer pool over the DMA window, the device ioctls as capture of the register image) and `VdecCore.c` (MPP's no-thread decode loop written out linearly). `VdecCore.h` is the API: `vdec_core_decode(bytes, eos, sink)` calls a function with each NV12 picture and a `run` callback with each job. `kernel/` has the libc shim headers and `KernelLibc.c` for the kernel build; the host build is `build-host.sh` |
 | `streams/` | The four H.264 streams the traces were recorded from, with the CRC-32 of each correct picture (display order): what the in-kernel self-test decodes |
 | `traces/` | Recorded jobs of ten streams, 10 pictures each: H.264 at 320x240 (CABAC, CAVLC, with B pictures) and 1280x720 (CABAC); H.265 at 320x240 (plain, with a B pyramid and non-reference B pictures, with default scaling matrices, deblocking off, WPP entry points) and 1280x720 |
@@ -156,10 +158,16 @@ MPP takes its vdpu34x path for H.265 only for that id. libhevc's encoder needs a
 
 Boot argument `rk3588-vdec=N`: 0 off (default); 1 look at the power domains and PLL rates (nothing is written); 2 also power the domains, set the clocks, reset, read the ID and IOMMU registers; 3 also replay
 every embedded trace once and compare; 4 repeat them `rk3588-vdec-passes=N` times (default 20); 5 as 3, then every embedded H.264 stream once through the decoder core and compare each picture's CRC-32;
-6 only the decoder core, `rk3588-vdec-passes=N` times, `rk3588-vdec-chunk=N` feeds the streams in pieces of N bytes. `rk3588-vdec-dump=1` hex-dumps the picture of the first job that mismatches;
-`rk3588-vdec-mpp-log=N` sets MPP's own log level.
+6 only the decoder core, `rk3588-vdec-passes=N` times, `rk3588-vdec-chunk=N` feeds the streams in pieces of N bytes; 7 registers the `AppleD5500` service (`rk3588-vdec-d5500-log=N`: how much traffic is printed).
+`rk3588-vdec-dump=1` hex-dumps the picture of the first job that mismatches; `rk3588-vdec-mpp-log=N` sets MPP's own log level. An error status of the block (error, timeout, empty buffer, collocated-MV reference error) makes the driver
+pulse the five soft resets after that job, as the vendor driver does (never exercised on the board: no job has reported an error since the cache fix).
 
-Not done: the userland side (AppleD5500 / AppleAVDUserClient on iPadOS: a kernel user client over the decoder core), H.265 in the kernel (the traces replay register images; MPP's `h265d` parser is not in the core), H.265 Main10, several slices or tiles (libhevc's encoder
+`patches/xnu/rk3588-wc-batch-flush.patch` (in the shared series, so every RK3588 board gets it) came out of this work: the pmap's batch path for cache attribute changes
+(`pmap_batch_set_cache_attributes_internal`, used by `vm_object_iopl_request`) never cleaned or invalidated the data cache when a page went from cacheable to non-cacheable, so a write-back of a dirty line of a fresh
+IOSurface page (zero fill, a previous owner's data) overwrote one 64-byte line of what the user had stored through the write-combined mapping. Minutes after boot that showed as zeroed extradata or frame bytes in the decoder's
+ring buffer; with the patch 248 of 248 VideoToolbox sessions were right (two boots, up to 16 passes and 727 s each) (`UniXNU-orangepi5/evidence/device-vdec-d5500-20261107.txt`). Not run on the EVB10.
+
+Not done: H.265 behind `AppleD5500` and in the kernel (the traces replay register images; MPP's `h265d` parser is not in the core), H.265 Main10, several slices or tiles (libhevc's encoder
 cannot make them), CRA / open GOP, H.264 interlaced, multi-slice and High profile streams (not in the traces), interrupt-driven completion (the replay polls), the IOMMU, the second core and the core combiner, DDR
 bandwidth management, the vendor clock rates.
 
