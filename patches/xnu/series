@@ -25,3 +25,6 @@ rk3588-emmc-personality.patch
 rk3588-root-trust.patch
 # Idle time of a CPU for the frequency governor in scripts/data/Rk3588Dvfs (a kernel extension cannot see struct processor)
 rk3588-cpu-idle.patch
+# A page that stops being cacheable in a batch (the pages of a fresh IOSurface, write-combined) must leave the data cache: without it a dirty line (the zero fill, the
+# page's previous owner) is written back after the owner's first stores and takes one 64-byte line of them away (lost lines in the video decoder's ring buffer)
+rk3588-wc-batch-flush.patch

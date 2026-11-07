@@ -1,0 +1,45 @@
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10739,6 +10739,19 @@
+ 				rt_cache_flush_pass_needed = true;
+ 			}
+ 
++			/*
++			 * RK3588: a page that stops being cacheable (an IOSurface or any other write-combined buffer: the pages of a fresh buffer come in this
++			 * batch, zero filled through the cacheable physical aperture or still holding the lines of their previous owner) must leave the data
++			 * cache before the first non-cacheable store of its new owner, or a dirty line is written back after the store and puts the old
++			 * contents (zeros) back, one 64-byte line at a time. The single page path (pmap_sync_wimg) does that; this batch path only did it
++			 * for the RT type, and then only a clean.
++			 */
++			if (wimg_bits_new != wimg_bits_prev &&
++			    !(wimg_bits_prev & VM_MEM_NOT_CACHEABLE) &&
++			    (wimg_bits_new & VM_MEM_NOT_CACHEABLE)) {
++				rt_cache_flush_pass_needed = true;
++			}
++
+ 			pvh_unlock(pai);
+ 
+ 			page_index++;
+@@ -10835,7 +10848,7 @@
+ 	}
+ 
+ 	if (state == PMAP_BATCH_SET_CACHE_ATTRIBUTES_CACHEFLUSH_PASS) {
+-		/* Pass 3: Flush the cache if the page is recently set to RT */
++		/* Pass 3: Flush the cache if the page is recently set to RT, or to a type that is not cacheable (RK3588) */
+ 		PMAP_TRACE(2, PMAP_CODE(PMAP__BATCH_UPDATE_CACHING), page_cnt, cacheattr, 0xCECC0DE3, page_index);
+ #if !XNU_MONITOR
+ 		/**
+@@ -10863,7 +10876,12 @@
+ 				panic("%s: page is not managed; addr: 0x%016llx", __func__, paddr);
+ 			}
+ 
+-			CleanPoC_DcacheRegion_Force_nopreempt_nohid(phystokv(paddr), PAGE_SIZE);
++			if ((cacheattr & VM_WIMG_MASK) == VM_WIMG_RT) {
++				CleanPoC_DcacheRegion_Force_nopreempt_nohid(phystokv(paddr), PAGE_SIZE);
++			} else {
++				/* clean and invalidate (DC CIVAC): the page is no longer cacheable, nothing of it may stay in the caches */
++				FlushPoC_DcacheRegion(phystokv(paddr), PAGE_SIZE);
++			}
+ 
+ 			page_index++;
+ 
