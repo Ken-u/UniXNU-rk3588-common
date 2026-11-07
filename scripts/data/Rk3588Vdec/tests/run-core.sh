@@ -1,6 +1,6 @@
 #!/bin/sh
 # Host test of the decoder core (MPP's H.264 parser + vdpu34x register generator) against the traces recorded from MPP on the board.
-# Needs MPP checked out at the commit in core/mpp.lock: MPP=/path/to/mpp tests/run-core.sh
+# MPP at the commit in core/mpp.lock is downloaded on first use (tree hash checked); MPP=/path/to/checkout uses a local one (also checked).
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 out=${TMPDIR:-/tmp}/vdec-core-host

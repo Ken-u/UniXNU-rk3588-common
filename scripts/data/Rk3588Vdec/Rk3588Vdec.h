@@ -9,7 +9,9 @@
 //   * a self-test that needs no operating system above the kernel: a recorded decode job sequence (traces/*.vdt) of Rockchip's own user-space library for
 //     an H.264 stream is replayed through the register file, the block decodes it, and the pictures are compared by CRC-32 with the output of a
 //     bit-exact software decoder (VdecTrace.h, tools/);
-//   * (later) the kernel-side of a VideoToolbox decoder: parse the H.264 / HEVC headers, build the register image, hand the pictures to IOSurface.
+//   * a decoder core (core/) that does the parsing itself: Rockchip's MPP H.264 parser and rkvdec2 register generator, compiled unmodified into the kernel
+//     behind a shim, turn embedded H.264 streams into jobs for the block, and the pictures are compared by CRC-32 with the reference decoder's;
+//   * (later) the kernel-side of a VideoToolbox decoder: hand the pictures to IOSurface through the user client of the iPadOS decoder service.
 //
 // What a board supplies: a DMA window the kernel does not use, below 4 GiB (the block is left in IOMMU bypass, so its bus addresses are physical), as
 // the `rk3588_vdec_config` of a source file of its own that `build-rk3588-vdec.py` compiles next to these.
@@ -18,8 +20,10 @@
 //
 // Boot argument rk3588-vdec=N: 0 off (default); 1 look only (print the PMU and CRU state that concerns the decoder: power domains, PLL rates; nothing is written);
 // 2 also power the domains on, set the clocks, release the resets and read the block's identification and IOMMU registers;
-// 3 also replay every embedded trace once and compare the pictures; 4 as 3, repeated rk3588-vdec-passes=N times (default 20) for timing.
-// rk3588-vdec-dump=1 hex-dumps the output picture of the first job that does not match.
+// 3 also replay every embedded trace once and compare the pictures; 4 as 3, repeated rk3588-vdec-passes=N times (default 20) for timing;
+// 5 as 3, then every embedded H.264 stream through the decoder core, once; 6 only the decoder core, rk3588-vdec-passes=N times.
+// rk3588-vdec-dump=1 hex-dumps the output picture of the first job that does not match. rk3588-vdec-chunk=N feeds the streams to the decoder core in
+// pieces of N bytes (default: whole); rk3588-vdec-mpp-log=N is how loud MPP's own messages are (1 fatal .. 6 verbose, default 3).
 #pragma once
 #include <stdint.h>
 

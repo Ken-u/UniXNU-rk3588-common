@@ -1,0 +1,21 @@
+# Include directories of the MPP sources the decoder core compiles, relative to the checkout (core/build-host.sh and, for the kernel,
+# scripts/build-rk3588-vdec.py read this; fetch_mpp.py hashes the headers in them).
+inc
+utils
+osal
+osal/inc
+mpp/inc
+mpp/base/inc
+kmpp/inc
+kmpp/base/inc
+mpp/common
+mpp/codec/inc
+mpp/hal/inc
+mpp/hal/common
+mpp/vproc/inc
+mpp/codec/dec/h264
+mpp/codec/dec/common
+mpp/hal/rkdec/inc
+mpp/hal/rkdec/h264d
+mpp/hal/rkdec/common
+mpp/hal/vpu

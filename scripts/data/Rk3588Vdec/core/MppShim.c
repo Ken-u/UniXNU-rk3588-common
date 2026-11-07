@@ -708,6 +708,10 @@ typedef struct ShimDev {
   uint32_t status;
   int sent;
   VdecJobObserver *observer;
+  // dev_send's working set: about 3 KiB, kept off the kernel stack
+  uint32_t sendRegs[kRegs];
+  VdecRun sendRuns[kRegs / 2 + 1];
+  VdecJobInfo sendInfo;
 } ShimDev;
 
 MPP_RET mpp_dev_init(MppDev *ctx, MppClientType type) {
@@ -749,12 +753,12 @@ MPP_RET mpp_dev_set_reg_offset(MppDev dev, RK_S32 index, RK_U32 offset) {
 }
 
 static MPP_RET dev_send(ShimDev *d) {
-  uint32_t regs[kRegs];
-  VdecRun runs[kRegs / 2 + 1];
+  uint32_t *regs = d->sendRegs;
+  VdecRun *runs = d->sendRuns;
   unsigned nRuns = 0;
-  VdecJobInfo info;
-  memcpy(regs, d->regs, sizeof regs);
-  memset(&info, 0, sizeof info);
+  VdecJobInfo *infop = &d->sendInfo;
+  memcpy(regs, d->regs, sizeof d->sendRegs);
+  memset(infop, 0, sizeof *infop);
   for (unsigned t = 0; t < sizeof kTrans / sizeof kTrans[0]; t++) {
     uint32_t idx = kTrans[t];
     if (!d->set[idx]) continue;
@@ -773,12 +777,12 @@ static MPP_RET dev_send(ShimDev *d) {
       return MPP_NOK;
     }
     regs[idx] = (uint32_t)(gWin.bus + b->winOff + off);
-    if (info.nReloc < VDEC_MAX_RELOCS) {
-      info.reloc[info.nReloc].reg = idx;
-      info.reloc[info.nReloc].buf = id;
-      info.reloc[info.nReloc].offset = off;
-      info.reloc[info.nReloc].bufSize = (uint32_t)b->size;
-      info.nReloc++;
+    if (infop->nReloc < VDEC_MAX_RELOCS) {
+      infop->reloc[infop->nReloc].reg = idx;
+      infop->reloc[infop->nReloc].buf = id;
+      infop->reloc[infop->nReloc].offset = off;
+      infop->reloc[infop->nReloc].bufSize = (uint32_t)b->size;
+      infop->nReloc++;
     }
   }
   for (unsigned i = 0; i < kRegs;) {
@@ -793,14 +797,14 @@ static MPP_RET dev_send(ShimDev *d) {
     nRuns++;
     i = j;
   }
-  info.rawRegs = d->regs;
-  info.regs = regs;
-  info.runs = runs;
-  info.nRuns = nRuns;
+  infop->rawRegs = d->regs;
+  infop->regs = regs;
+  infop->runs = runs;
+  infop->nRuns = nRuns;
   d->status = 0;
-  if (d->observer && d->observer->before) d->observer->before(d->observer->ctx, &info);
+  if (d->observer && d->observer->before) d->observer->before(d->observer->ctx, infop);
   int rc = gHw->run(gHw->ctx, regs, runs, nRuns, &d->status);
-  if (d->observer && d->observer->after) d->observer->after(d->observer->ctx, &info, rc, d->status);
+  if (d->observer && d->observer->after) d->observer->after(d->observer->ctx, infop, rc, d->status);
   d->sent = 1;
   return rc == 0 ? MPP_OK : MPP_NOK;
 }

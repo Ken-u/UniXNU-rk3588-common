@@ -1,21 +1,18 @@
 #!/bin/sh
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 #
-# Builds the decoder core for the host: MPP's sources (core/mpp-files.txt, from the checkout in $MPP) with the shim and the loop of this directory, into
-# the static library $OUT/libvdeccore.a. The host test links it. Usage: MPP=/path/to/mpp [CC=cc] [SAN=1] build-host.sh OUT
+# Builds the decoder core for the host: MPP's sources (core/mpp-files.txt, from the checkout in $MPP or the pinned download) with the shim and the loop of this directory, into
+# the static library $OUT/libvdeccore.a. The host test links it. Usage: [MPP=/path/to/mpp] [CC=cc] [SAN=1] build-host.sh OUT (without MPP the pinned commit is downloaded to ~/.cache/unixnu-mpp)
 set -e
 out=$1
-[ -n "$out" ] && [ -n "$MPP" ] || { sed -n 3,6p "$0"; exit 1; }
+[ -n "$out" ] || { sed -n 3,6p "$0"; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
-want=$(sed -n 's/^commit=//p' "$here/mpp.lock")
-have=$(git -C "$MPP" rev-parse HEAD 2>/dev/null || echo unknown)
-[ "$want" = "$have" ] || { echo "MPP is at $have, core/mpp.lock wants $want" >&2; exit 1; }
+MPP=$(python3 "$here/fetch_mpp.py" "${MPP_CACHE:-}")   # $MPP if set, else a download (checked against mpp.lock either way)
 CC=${CC:-cc}
 mkdir -p "$out/obj"
 python3 "$here/derive-mpp.py" "$MPP" "$out"
-inc="-I$here -I$MPP/inc -I$MPP/utils -I$MPP/osal/inc -I$MPP/mpp/inc -I$MPP/mpp/base/inc -I$MPP/kmpp/inc -I$MPP/kmpp/base/inc -I$MPP/mpp/common \
--I$MPP/mpp/codec/inc -I$MPP/mpp/hal/inc -I$MPP/mpp/hal/common -I$MPP/mpp/vproc/inc -I$MPP/mpp/codec/dec/h264 -I$MPP/mpp/codec/dec/common \
--I$MPP/mpp/hal/rkdec/inc -I$MPP/mpp/hal/rkdec/h264d -I$MPP/mpp/hal/rkdec/common -I$MPP/mpp/hal/vpu -I$MPP/osal"
+inc="-I$here"
+for d in $(grep -v '^#' "$here/mpp-includes.txt" | grep -v '^$'); do inc="$inc -I$MPP/$d"; done
 defs="-DARCH_X64=1 -DARCH_X86=1 -DHAVE_H264D -DHW_VDPU34X -DHW_VDPU381"
 san=""
 [ -n "$SAN" ] && san="-fsanitize=address,undefined -fno-sanitize-recover=undefined"

@@ -219,6 +219,45 @@ struct JobResult {
   bool crcOk;           // the block finished without an error bit and the picture has the trace's CRC
 };
 
+// The hardware half of a job: the cache permissions, the register runs (`runAt(i, &first, &count)` gives run i; register 10, the start, is written last, with
+// bit 0 set) and the wait for the interrupt (at most `timeoutUs`). True when the block raised it; *status is what register 224 held, *runUs the time from the
+// start to the interrupt. The interrupt is cleared afterwards, as rkvdec2_irq() does, and the status is the caller's to judge.
+template <typename RunAt>
+inline bool executeJob(const Hw &hw, const uint32_t regs[kRegCount], unsigned runCount, RunAt runAt, uint32_t timeoutUs, uint64_t *runUs, uint32_t *status) {
+  hw.barrier(hw.ctx);
+  hw.write32(hw.ctx, kRegCache0Size, kCachePermit);
+  hw.write32(hw.ctx, kRegCache1Size, kCachePermit);
+  hw.write32(hw.ctx, kRegCache2Size, kCachePermit);
+  hw.write32(hw.ctx, kRegClrCache0, 1);
+  hw.write32(hw.ctx, kRegClrCache1, 1);
+  hw.write32(hw.ctx, kRegClrCache2, 1);
+  for (unsigned i = 0; i < runCount; ++i) {
+    uint32_t first = 0, count = 0;
+    runAt(i, &first, &count);
+    for (uint32_t r = first; r < first + count && r < kRegCount; ++r)
+      if (r != kRegStart) hw.write32(hw.ctx, 4 * r, regs[r]);
+  }
+  hw.barrier(hw.ctx);
+  const uint64_t start = hw.nowUs(hw.ctx);
+  hw.write32(hw.ctx, 4 * kRegStart, regs[kRegStart] | 1);
+  uint32_t st = 0;
+  bool done = false;
+  while (true) {
+    st = hw.read32(hw.ctx, kRegIrq);
+    if (st & kStaIrqRaw) {
+      done = true;
+      break;
+    }
+    if (hw.nowUs(hw.ctx) - start > timeoutUs) break;
+    hw.delayUs(hw.ctx, 20);
+  }
+  *runUs = hw.nowUs(hw.ctx) - start;
+  *status = st;
+  if (done) hw.write32(hw.ctx, kRegIrq, 0);
+  hw.barrier(hw.ctx);
+  return done;
+}
+
 // Runs the jobs of a trace on the block behind `hw`. The block must be powered, clocked and out of reset, and its IOMMU must not translate.
 class Player {
  public:
@@ -248,35 +287,15 @@ class Player {
     }
     // The picture is overwritten by the block; a stale one from a previous pass must not make a dead block look alive.
     memset(hw_.dmaVirt + trace_.bufOffset(job.outBuf) + job.outOffset, 0, job.outLen);
-    hw_.barrier(hw_.ctx);
-    hw_.write32(hw_.ctx, kRegCache0Size, kCachePermit);
-    hw_.write32(hw_.ctx, kRegCache1Size, kCachePermit);
-    hw_.write32(hw_.ctx, kRegCache2Size, kCachePermit);
-    hw_.write32(hw_.ctx, kRegClrCache0, 1);
-    hw_.write32(hw_.ctx, kRegClrCache1, 1);
-    hw_.write32(hw_.ctx, kRegClrCache2, 1);
-    for (uint32_t i = 0; i < job.runCount; ++i)
-      for (uint32_t r = job.runs[i][0]; r < job.runs[i][0] + job.runs[i][1]; ++r)
-        if (r != kRegStart) hw_.write32(hw_.ctx, 4 * r, regs[r]);
-    hw_.barrier(hw_.ctx);
-    const uint64_t start = hw_.nowUs(hw_.ctx);
-    hw_.write32(hw_.ctx, 4 * kRegStart, regs[kRegStart] | 1);
+    uint64_t runUs = 0;
     uint32_t status = 0;
-    bool done = false;
-    while (true) {
-      status = hw_.read32(hw_.ctx, kRegIrq);
-      if (status & kStaIrqRaw) {
-        done = true;
-        break;
-      }
-      if (hw_.nowUs(hw_.ctx) - start > timeoutUs) break;
-      hw_.delayUs(hw_.ctx, 20);
-    }
-    result->runUs = hw_.nowUs(hw_.ctx) - start;
+    const bool done = executeJob(hw_, regs, job.runCount, [&](unsigned i, uint32_t *first, uint32_t *count) {
+      *first = job.runs[i][0];
+      *count = job.runs[i][1];
+    }, timeoutUs, &runUs, &status);
+    result->runUs = runUs;
     result->done = done;
     result->status = status;
-    if (done) hw_.write32(hw_.ctx, kRegIrq, 0);   // what rkvdec2_irq() does: the interrupt off, the status is ours
-    hw_.barrier(hw_.ctx);
     result->crc = crc32(hw_.dmaVirt + trace_.bufOffset(job.outBuf) + job.outOffset, job.outLen);
     result->crcOk = done && !(status & kStaErrorMask) && result->crc == job.outCrc;
     return result->crcOk;
