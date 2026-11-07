@@ -305,8 +305,8 @@ static void testStream(const std::string &path) {
           read = true;
           CHECKF(info.numRefFrames == vpsValue, "SPS says %u pictures, the VPS %u", info.numRefFrames, vpsValue);
         }
-      // (the stream with two temporal layers has a longer profile_tier_level: not read)
-      CHECKF(read || path.find("_hevc_b.") != std::string::npos, "%s: the VPS could not be read", path.c_str());
+      // (every embedded stream has one temporal layer in its VPS, including t320_hevc_b whose pictures use two temporal ids)
+      CHECKF(read, "%s: the VPS could not be read", path.c_str());
     }
     if (codec == kVdecH264 && v.kind == 0) {
       // profile_idc and level_idc are bytes 1 and 3 of the SPS NAL unit
