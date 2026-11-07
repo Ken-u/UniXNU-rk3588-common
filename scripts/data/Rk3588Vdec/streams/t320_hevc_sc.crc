@@ -1,0 +1,11 @@
+# CRC-32 of each decoded picture (NV12, 320x240), display order: libhevc 48cb531 (equal to the stream's own decoded picture hashes, tools/check-hevc-sei.py), the reference of traces/t320_hevc_sc.vdt
+d691dace
+78af6d70
+c3070ee3
+6e703688
+b9b82a49
+559161a4
+2e371001
+c26f1e47
+eedfc9a0
+1660df45

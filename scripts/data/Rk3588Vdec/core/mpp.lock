@@ -1,4 +1,4 @@
 # The MPP checkout the decoder core is built from (the same commit the traces were recorded with).
 repo=https://github.com/rockchip-linux/mpp
 commit=9b56348cc61393c84662e6d6dd78feae67773a36
-tree_sha256=66804a4072c7e36dc6a898081c6a70f9aadd83f95bb0def6fd8b749db75b37a0
+tree_sha256=89c3b17a0d0a648f09984d987fa66d5ac0a8b55eb0a433c79adb60639593aea1

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 //
-// test-core.cpp -- host test of the decoder core (core/): MPP's H.264 parser and vdpu34x register generator, run in a program of ours on a stream, must
+// test-core.cpp -- host test of the decoder core (core/): MPP's H.264 / H.265 parser and vdpu34x register generator, run in a program of ours on a stream, must
 // produce exactly the decode jobs MPP produced on a real board when it decoded the same stream (traces/*.vdt, recorded with tools/trace-shim.c).
 //
-//   test-core STREAM.h264 TRACE.vdt STREAM.crc ...     (three arguments per stream)
+//   test-core STREAM.h264|STREAM.h265 TRACE.vdt STREAM.crc ...     (three arguments per stream; the extension says the codec)
 //
 // There is no block here: the "block" accepts every job and answers "done". For each job the test checks, against the trace's job of the same number:
 //   - the same registers are written, with the same values (the address registers excepted),
@@ -249,7 +249,8 @@ static void testStream(const std::string &streamPath, const std::string &tracePa
 
   VdecHw hw = {&h, h.virt, h.bus, static_cast<uint32_t>(h.window.size()), Harness::run};
   VdecCore *core = nullptr;
-  CHECK(vdec_core_create(&core, &hw, kVdecH264) == 0);
+  const bool hevc = streamPath.size() > 5 && streamPath.compare(streamPath.size() - 5, 5, ".h265") == 0;
+  CHECK(vdec_core_create(&core, &hw, hevc ? kVdecH265 : kVdecH264) == 0);
   if (!core) return;
   VdecJobObserver obs = {&h, Harness::before, Harness::after};
   vdec_core_set_observer(core, &obs);

@@ -13,7 +13,7 @@ mkdir -p "$out/obj"
 python3 "$here/derive-mpp.py" "$MPP" "$out"
 inc="-I$here"
 for d in $(grep -v '^#' "$here/mpp-includes.txt" | grep -v '^$'); do inc="$inc -I$MPP/$d"; done
-defs="-DARCH_X64=1 -DARCH_X86=1 -DHAVE_H264D -DHW_VDPU34X -DHW_VDPU381"
+defs="-DARCH_X64=1 -DARCH_X86=1 -DHAVE_H264D -DHAVE_H265D -DHW_VDPU34X -DHW_VDPU381"
 san=""
 [ -n "$SAN" ] && san="-fsanitize=address,undefined -fno-sanitize-recover=undefined"
 # MPP's own code, three checks off: mpp_slots_set_prop() reads 4 bytes through its `val` before it looks at the property, and for the alignment callbacks

@@ -26,11 +26,26 @@
 #include "mpp_parser.h"
 #include "mpp_soc.h"
 
-// from MPP's tree: the parser and the register generator of the codec
-extern const ParserApi mpp_h264d;
-extern const MppHalApi hal_h264d_vdpu34x;
+// from MPP's tree: the parsers and the register generators of the codecs
+extern const ParserApi mpp_h264d, mpp_h265d;
+extern const MppHalApi hal_h264d_vdpu34x, hal_h265d_vdpu34x;
 
 #define kHalTasks 3   // MPP: hal_task_count when the HAL supports fast parse
+
+// H.265: the stream is cut into access units here, not by MPP's splitter (see MppShim.c, mpp_ring): what has been fed and is not yet known to be complete.
+#define kMaxSegments 32
+typedef struct HevcAu {
+  uint8_t *buf;
+  size_t len, cap;
+  size_t scanned;          // bytes of buf the scanner has looked at
+  uint64_t scan;           // the last eight bytes it saw
+  int vclSeen;             // a first slice segment of the access unit being collected has been seen (MPP: nal_boundary_detected)
+  struct {
+    size_t at;             // offset in buf where the bytes of one call to vdec_core_decode start
+    int64_t pts;
+  } seg[kMaxSegments];
+  unsigned nSeg;
+} HevcAu;
 
 struct VdecCore {
   VdecHw hw;
@@ -48,6 +63,7 @@ struct VdecCore {
   int taskParsed;            // the parser produced a task that is not finished (a format change in the way)
   int infoUpdated;
   VdecStats stats;
+  HevcAu au;
 };
 
 static VdecCore *gOpen;
@@ -79,7 +95,7 @@ int vdec_core_create(VdecCore **out, const VdecHw *hw, int codec) {
   MppCodingType coding;
   RK_U32 halTasks = 2;
 
-  if (!out || !hw || !hw->run || codec != kVdecH264) return -1;
+  if (!out || !hw || !hw->run || (codec != kVdecH264 && codec != kVdecH265)) return -1;
   *out = NULL;
   if (gOpen) {
     mpp_err("only one decoder can use the block\n");
@@ -89,7 +105,7 @@ int vdec_core_create(VdecCore **out, const VdecHw *hw, int codec) {
   if (!core) return -1;
   core->hw = *hw;
   core->codec = codec;
-  coding = MPP_VIDEO_CodingAVC;
+  coding = codec == kVdecH265 ? MPP_VIDEO_CodingHEVC : MPP_VIDEO_CodingAVC;
   vdec_shim_bind(&core->hw);
 
   // MPP's defaults (mpp_dec_cfg_set_default) and what mpp_init / the decoder test program set on top
@@ -99,7 +115,7 @@ int vdec_core_create(VdecCore **out, const VdecHw *hw, int codec) {
   core->cfg.base.fast_parse = 1;
   core->cfg.base.enable_fast_play = MPP_ENABLE_FAST_PLAY;
   core->cfg.base.meta_chk_len = MPP_DEC_META_CHK_LEN_DEFAULT;
-  core->cfg.base.split_parse = 1;
+  core->cfg.base.split_parse = codec == kVdecH264;   // H.265: access units are cut here (hevc_feed)
   core->cfg.base.disable_thread = 1;
 
   core->decCb.callBack = callback_hal_to_parser;
@@ -112,8 +128,13 @@ int vdec_core_create(VdecCore **out, const VdecHw *hw, int codec) {
   do {
     if (mpp_buf_slot_init(&core->frameSlots) || mpp_buf_slot_init(&core->packetSlots)) break;
 
-    mpp_hal_api_register(&hal_h264d_vdpu34x);
-    mpp_parser_api_register(&mpp_h264d);
+    if (codec == kVdecH265) {
+      mpp_hal_api_register(&hal_h265d_vdpu34x);
+      mpp_parser_api_register(&mpp_h265d);
+    } else {
+      mpp_hal_api_register(&hal_h264d_vdpu34x);
+      mpp_parser_api_register(&mpp_h264d);
+    }
 
     memset(&fbcAdj, 0, sizeof fbcAdj);
     {
@@ -175,6 +196,7 @@ void vdec_core_destroy(VdecCore *core) {
   if (core->packetSlots) mpp_buf_slot_deinit(core->packetSlots);
   if (core->packetGroup) mpp_buffer_group_put(core->packetGroup);
   if (core->frameGroup) mpp_buffer_group_put(core->frameGroup);
+  if (core->au.buf) mpp_free(core->au.buf);
   if (gOpen == core) gOpen = NULL;
   mpp_free(core);
 }
@@ -382,8 +404,115 @@ static int feed(VdecCore *core, const uint8_t *data, size_t size, int64_t pts, i
   return out;
 }
 
+// ---- H.265: access units
+//
+// The rule is MPP's (h265d_find_frame_end in h265d_spliter.c): an access unit ends where the next one starts, which is at a VPS, SPS, PPS, AUD, prefix SEI (or one of
+// the reserved types 41..44 and 48..55) once a slice of the unit has been seen, or at the first slice segment of a picture once a first slice segment has been seen. A
+// 3 byte start code is where the cut goes; the zero byte of a 4 byte start code stays at the end of the previous unit (trailing_zero_8bits).
+static int hevc_emit(VdecCore *core, size_t cut, const VdecSink *sink) {
+  HevcAu *au = &core->au;
+  // the unit starts at offset 0 and the first segment always does too: its pts is the presentation time given with the first byte of the unit
+  int n = feed(core, au->buf, cut, au->nSeg ? au->seg[0].pts : 0, 0, sink);
+  // what is left moves to the front, and the segments with it
+  memmove(au->buf, au->buf + cut, au->len - cut);
+  au->len -= cut;
+  au->scanned -= cut;
+  if (!au->len) {
+    au->nSeg = 0;
+    return n;
+  }
+  unsigned out = 0, last = 0;
+  for (unsigned i = 0; i < au->nSeg; i++)
+    if (au->seg[i].at <= cut) last = i;
+  for (unsigned i = last; i < au->nSeg; i++) {
+    au->seg[out] = au->seg[i];
+    au->seg[out].at = au->seg[i].at > cut ? au->seg[i].at - cut : 0;
+    out++;
+  }
+  au->nSeg = out;
+  return n;
+}
+
+// Takes the bytes in and emits every access unit that is complete; with `eos` the last one as well.
+static int hevc_feed(VdecCore *core, const uint8_t *data, size_t size, int64_t pts, int eos, const VdecSink *sink) {
+  HevcAu *au = &core->au;
+  int out = 0;
+
+  if (size) {
+    if (au->len + size > au->cap) {
+      size_t cap = au->cap ? au->cap : 65536;
+      while (cap < au->len + size) cap *= 2;
+      uint8_t *grown = (uint8_t *)mpp_malloc(uint8_t, cap);
+      if (!grown) return -1;
+      if (au->len) memcpy(grown, au->buf, au->len);
+      if (au->buf) mpp_free(au->buf);
+      au->buf = grown;
+      au->cap = cap;
+    }
+    if (au->len == 0) au->nSeg = 0;
+    if (au->nSeg == 0 || au->seg[au->nSeg - 1].pts != pts) {
+      if (au->nSeg == kMaxSegments) {   // more calls in one unit than we remember: the oldest are forgotten (the unit takes the pts of the oldest left)
+        memmove(&au->seg[0], &au->seg[1], (kMaxSegments - 1) * sizeof au->seg[0]);
+        au->nSeg--;
+        au->seg[0].at = 0;
+      }
+      au->seg[au->nSeg].at = au->len;
+      au->seg[au->nSeg].pts = pts;
+      au->nSeg++;
+    }
+    memcpy(au->buf + au->len, data, size);
+    au->len += size;
+  }
+
+  while (au->scanned < au->len) {
+    size_t i = au->scanned++;
+    au->scan = (au->scan << 8) | au->buf[i];
+    if (((au->scan >> 24) & 0xFFFFFF) != 1) continue;
+    // the start code is buf[i-5 .. i-3], the NAL header buf[i-2], buf[i-1], the first byte of the slice segment header buf[i]
+    int nut = (int)((au->scan >> 17) & 0x3F);
+    int layer = (int)((((au->scan >> 16) & 0x01) << 5) + (((au->scan >> 8) & 0xF8) >> 3));
+    int cut = 0;
+    if ((nut >= 32 && nut <= 35) || nut == 39 || (nut >= 41 && nut <= 44) || (nut >= 48 && nut <= 55)) {   // VPS .. AUD, prefix SEI
+      if (au->vclSeen && !layer) {
+        au->vclSeen = 0;
+        cut = 1;
+      }
+    } else if (nut <= 9 || (nut >= 16 && nut <= 21)) {   // a slice segment
+      if ((au->buf[i] >> 7) && !layer) {
+        if (!au->vclSeen) au->vclSeen = 1;
+        else cut = 1;
+      }
+    }
+    if (cut) {
+      int n = hevc_emit(core, i - 5, sink);
+      if (n < 0) return -1;
+      out += n;
+      au->vclSeen = (nut <= 9 || (nut >= 16 && nut <= 21)) ? 1 : 0;   // the unit that starts here has had its first slice segment if the cut was one
+    }
+  }
+
+  if (eos && au->len) {
+    int n = hevc_emit(core, au->len, sink);
+    if (n < 0) return -1;
+    out += n;
+    au->scan = 0;
+    au->vclSeen = 0;
+  }
+  return out;
+}
+
 int vdec_core_decode(VdecCore *core, const uint8_t *data, size_t size, int64_t pts, int eos, const VdecSink *sink) {
   if (!core || (size && !data)) return -1;
+  if (core->codec == kVdecH265) {
+    int n = hevc_feed(core, data, size, pts, eos, sink);
+    if (n < 0) return n;
+    if (eos) {
+      int m = feed(core, NULL, 0, pts, 1, sink);
+      if (m < 0) return m;
+      n += m;
+    }
+    return n;
+  }
   // The H.264 parser throws away the data of an end-of-stream packet shorter than four bytes (it takes it for the empty marker MPP's own applications send,
   // h264d_prepare), so the end of the stream always goes in as a packet of its own, empty.
   int out = 0;
@@ -402,6 +531,11 @@ int vdec_core_decode(VdecCore *core, const uint8_t *data, size_t size, int64_t p
 void vdec_core_reset(VdecCore *core) {
   HalDecTask *dec = &core->task.dec;
   RK_S32 index;
+
+  core->au.len = core->au.scanned = 0;
+  core->au.scan = 0;
+  core->au.vclSeen = 0;
+  core->au.nSeg = 0;
 
   mpp_parser_reset(core->parser);
   mpp_hal_reset(core->hal);

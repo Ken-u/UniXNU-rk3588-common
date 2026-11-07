@@ -14,8 +14,10 @@ mpp/hal/inc
 mpp/hal/common
 mpp/vproc/inc
 mpp/codec/dec/h264
+mpp/codec/dec/h265
 mpp/codec/dec/common
 mpp/hal/rkdec/inc
 mpp/hal/rkdec/h264d
+mpp/hal/rkdec/h265d
 mpp/hal/rkdec/common
 mpp/hal/vpu

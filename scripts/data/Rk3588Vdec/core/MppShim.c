@@ -35,6 +35,9 @@
 #include "rk_mpp_cfg.h"
 #include "rk_vdec_cfg.h"
 #include "hal_dbg.h"
+#include "hal_hw_id.h"
+#include "mpp_platform.h"
+#include "mpp_ring.h"
 
 // ------------------------------------------------------------------------------------------------------------------------------------------------
 // memory, log, environment, singletons
@@ -175,11 +178,46 @@ const MppDecHwCap *mpp_get_dec_hw_info_by_client_type(MppClientType client_type)
   return client_type == VPU_CLIENT_RKVDEC ? &gHwCap : NULL;
 }
 
+// osal/mpp_platform.c: the ID the block's register 0 reads on an RK3588 (read on the board: 0x53813f05, MPP's HWID_VDPU38X). The H.265 register generator takes its
+// vdpu34x path (the register layout of the RK3588's rkvdec2, with the RCB buffers and the scaling list page) only for this ID or the RK3568's.
+rk_u32 mpp_get_client_hw_id(rk_s32 client_type) { return client_type == VPU_CLIENT_RKVDEC ? HWID_VDPU38X : 0; }
+
 // MPP's compatibility switches (osal/mpp_compat.c): all off, like on a stock board
 static RK_S32 gZero;
 RK_S32 *compat_ext_fbc_buf_size = &gZero;
 RK_S32 *compat_ext_async_input = &gZero;
 RK_S32 *compat_ext_fbc_hdr_256_odd = &gZero;
+
+// ------------------------------------------------------------------------------------------------------------------------------------------------
+// osal/mpp_ring.c: the ring buffer of the H.265 stream splitter (mpp/codec/dec/h265/h265d_spliter.c) -- not provided
+//
+// MPP's ring is a memfd mapped twice one after the other, so that a piece of stream that runs over the end continues at the start; the splitter relies on it
+// (its wrapped writes, and the frames it hands out as pointers into the ring). The core does not use that splitter: it cuts the stream into access units itself
+// (core/VdecCore.c, hevc_*) and runs the parser with split_parse = 0, one access unit per packet. MPP's splitter also hands out frames in place and then
+// overwrites their first bytes when a start code is cut by the end of an input piece (tests/test-core.cpp found it with 1000 byte pieces: the NAL header of a slice
+// replaced by the next one's). The functions exist so that the splitter links; they fail, so that nothing can start it without noticing.
+// ------------------------------------------------------------------------------------------------------------------------------------------------
+
+rk_s32 mpp_ring_get(MppRing *ring, rk_s32 size, const char *name) {
+  (void)size;
+  (void)name;
+  if (ring) *ring = NULL;
+  mpp_err("the stream splitter of the H.265 parser is not available (split_parse must be 0)\n");
+  return rk_nok;
+}
+rk_s32 mpp_ring_put(MppRing ring) {
+  (void)ring;
+  return rk_nok;
+}
+void *mpp_ring_get_ptr(MppRing ring) {
+  (void)ring;
+  return NULL;
+}
+void *mpp_ring_resize(MppRing ring, rk_s32 new_size) {
+  (void)ring;
+  (void)new_size;
+  return NULL;
+}
 
 // ------------------------------------------------------------------------------------------------------------------------------------------------
 // debug dumps of the HAL (files in MPP): off

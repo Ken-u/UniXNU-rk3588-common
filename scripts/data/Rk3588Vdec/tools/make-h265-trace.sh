@@ -17,11 +17,13 @@
 #   [ENC_SET='--max_temporal_layers 2 --frame_qp 24'] make-h265-trace.sh NAME WIDTH HEIGHT FRAMES WORKDIR
 # ENC_SET overrides keys of the sample config (key and value pairs, as in the file). The default is constant QP 28 (--rate_control_mode 3 --frame_qp 28), one IDR
 # (no CRA, no later I pictures), no B pyramid (--max_temporal_layers 0).
+# TRACE_OUT (default ../traces) is where the .vdt goes (traces/mpp-nt/: recorded with MPP's no-thread test, MPI_DEC_TEST=.../mpi_dec_nt_test, what tests/run-core.sh compares
+# the decoder core with). STREAMS_OUT=../streams also keeps the stream (NAME.h265) and the CRC-32 of each reference picture (NV12, display order) for the core test.
 set -e
 name=$1 width=$2 height=$3 frames=$4 work=$5
-[ -n "$work" ] || { sed -n 3,21p "$0"; exit 1; }
+[ -n "$work" ] || { sed -n 3,23p "$0"; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
-out="$here/../traces"
+out="${TRACE_OUT:-$here/../traces}"
 mkdir -p "$work" "$out"
 cd "$work"
 cc -O1 -g -Wall -shared -fPIC -o trace-shim.so "$here/trace-shim.c" -ldl -lpthread
@@ -75,3 +77,18 @@ rm -rf "$name.jobs"
 VDEC_TRACE_DIR="$work/$name.jobs" LD_PRELOAD="$work/trace-shim.so" timeout 120 "$MPI_DEC_TEST" -t 16777220 -i "$name.265" -n "$frames" -o "$work/$name.mpp.yuv" > "$name.mpp.log" 2>&1 || true
 python3 "$here/make-trace.py" "$name.jobs" --ref "$name.ref.yuv" --width "$width" --height "$height" --jobs "$frames" --mpp-out "$name.mpp.yuv" --out "$out/$name"
 rm -f "$out/$name.inc"   # build-rk3588-vdec.py generates the C array at build time
+if [ -n "$STREAMS_OUT" ]; then
+  mkdir -p "$STREAMS_OUT"
+  cp "$name.265" "$STREAMS_OUT/$name.h265"
+  "$py" - "$name" "$width" "$height" "$STREAMS_OUT" <<'PY'
+import sys, zlib
+name, w, h, out = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+data = open(name + '.ref.yuv', 'rb').read(); n = w * h * 3 // 2
+with open('%s/%s.crc' % (out, name), 'w') as f:
+    f.write('# CRC-32 of each decoded picture (NV12, %dx%d), display order: libhevc 48cb531 (equal to the stream\'s own decoded picture hashes, tools/check-hevc-sei.py), the reference of traces/%s.vdt\n' % (w, h, name))
+    for k in range(len(data) // n):
+        p = data[k * n:(k + 1) * n]; y = p[:w * h]; u = p[w * h:w * h * 5 // 4]; v = p[w * h * 5 // 4:]
+        nv = bytearray(w * h // 2); nv[0::2] = u; nv[1::2] = v
+        f.write('%08x\n' % (zlib.crc32(y + bytes(nv)) & 0xffffffff))
+PY
+fi

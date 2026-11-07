@@ -13,6 +13,17 @@ mpp/codec/dec/h264/h264d_sei.c
 mpp/codec/dec/h264/h264d_slice.c
 mpp/codec/dec/h264/h264d_sps.c
 mpp/codec/dec/common/h2645d_sei.c
+
+# the H.265 parser
+mpp/codec/dec/h265/h265d_api.c
+mpp/codec/dec/h265/h265d_dpb.c
+mpp/codec/dec/h265/h265d_flow.c
+mpp/codec/dec/h265/h265d_pps.c
+mpp/codec/dec/h265/h265d_sei.c
+mpp/codec/dec/h265/h265d_spliter.c
+mpp/codec/dec/h265/h265d_sps.c
+mpp/codec/dec/h265/h265d_syntax.c
+mpp/codec/dec/h265/h265d_vps.c
 mpp/codec/mpp_parser.c
 
 # decoded picture bookkeeping, frames, packets, bit reader / writer
@@ -28,6 +39,8 @@ mpp/hal/rkdec/h264d/hal_h264d_vdpu34x.c
 mpp/hal/rkdec/h264d/hal_h264d_com.c
 mpp/hal/rkdec/h264d/hal_h264d_vdpu_com.c
 mpp/hal/rkdec/h264d/hal_h264d_rkv_reg.c
+mpp/hal/rkdec/h265d/hal_h265d_com.c
+mpp/hal/rkdec/h265d/hal_h265d_vdpu34x.c
 mpp/hal/common/hal_bufs.c
 mpp/hal/rkdec/common/vdpu34x_com.c
 mpp/hal/rkdec/common/vdpu38x_com.c

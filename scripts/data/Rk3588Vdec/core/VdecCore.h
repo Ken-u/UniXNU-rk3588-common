@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 //
-// VdecCore.h -- a video decoder made of Rockchip's own MPP code: the parser of the codec (H.264 so far) and the register generator of the rkvdec2 block,
+// VdecCore.h -- a video decoder made of Rockchip's own MPP code: the parser of the codec (H.264 or H.265) and the register generator of the rkvdec2 block,
 // both unmodified, driven by a small loop of ours (core/VdecCore.c) instead of MPP's threads and its Linux driver (core/MppShim.c). The caller hands
 // over stream bytes; pictures (NV12, in the DMA window) come back through a callback; every job the block has to run goes to the `run` callback.
 //
@@ -81,7 +81,7 @@ typedef struct VdecStats {
 
 typedef struct VdecCore VdecCore;
 
-enum { kVdecH264 = 0 };
+enum { kVdecH264 = 0, kVdecH265 = 1 };
 
 // Opens a decoder on `hw`. One block, one window: only one core may be open at a time.
 int vdec_core_create(VdecCore **out, const VdecHw *hw, int codec);
