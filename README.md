@@ -158,7 +158,7 @@ MPP takes its vdpu34x path for H.265 only for that id. libhevc's encoder needs a
 
 Boot argument `rk3588-vdec=N`: 0 off (default); 1 look at the power domains and PLL rates (nothing is written); 2 also power the domains, set the clocks, reset, read the ID and IOMMU registers; 3 also replay
 every embedded trace once and compare; 4 repeat them `rk3588-vdec-passes=N` times (default 20); 5 as 3, then every embedded H.264 stream once through the decoder core and compare each picture's CRC-32;
-6 only the decoder core, `rk3588-vdec-passes=N` times, `rk3588-vdec-chunk=N` feeds the streams in pieces of N bytes; 7 registers the `AppleD5500` service (`rk3588-vdec-d5500-log=N`: how much traffic is printed).
+6 only the decoder core, `rk3588-vdec-passes=N` times, `rk3588-vdec-chunk=N` feeds the streams in pieces of N bytes; 7 registers the `AppleD5500` service (`rk3588-vdec-d5500-log=N`: how much traffic is printed; 2 and up also reads every picture twice a byte at a time to check its CRC-32, which costs about 100 ns a byte: 25 ms a frame at 320x240, 300 ms at 720p).
 `rk3588-vdec-dump=1` hex-dumps the picture of the first job that mismatches; `rk3588-vdec-mpp-log=N` sets MPP's own log level. An error status of the block (error, timeout, empty buffer, collocated-MV reference error) makes the driver
 pulse the five soft resets after that job, as the vendor driver does (never exercised on the board: no job has reported an error since the cache fix).
 
@@ -166,6 +166,11 @@ pulse the five soft resets after that job, as the vendor driver does (never exer
 (`pmap_batch_set_cache_attributes_internal`, used by `vm_object_iopl_request`) never cleaned or invalidated the data cache when a page went from cacheable to non-cacheable, so a write-back of a dirty line of a fresh
 IOSurface page (zero fill, a previous owner's data) overwrote one 64-byte line of what the user had stored through the write-combined mapping. Minutes after boot that showed as zeroed extradata or frame bytes in the decoder's
 ring buffer; with the patch 248 of 248 VideoToolbox sessions were right (two boots, up to 16 passes and 727 s each) (`UniXNU-orangepi5/evidence/device-vdec-d5500-20261107.txt`). Not run on the EVB10.
+
+What a frame costs through VideoToolbox (log level 1, the default; `UniXNU-orangepi5/evidence/device-vdec-perf-20261107.txt`): the service prints a two-line profile when a decoder is destroyed. At 320x240 about 0.3 ms a frame
+in the service (the block 0.07 ms from start to interrupt, the job runner 0.11, the CPU copy of the picture into the surface 0.08), at 1280x720 about 2.2 ms (the block 0.65 ms, the copy 1.2 ms: the copy is now the larger part).
+The 25 to 300 ms of the first runs were the log-level-2 CRC check above, which used to be on by default. A whole session of ten pictures (first frame in to the last picture out, as the test tool sees it) takes 49 ms at 320x240
+and 147 ms at 720p; the test tool's own copy and CRC of each picture are 8 ms of the first and 82 ms of the second, the rest (the first picture comes 9 to 13 ms after the first frame; the serial log lines; VideoToolbox itself) was not split further. A decoder is reset before it is destroyed, so MPP's `mpp_buf_slot` no longer asserts at the end of the B-frame stream.
 
 Not done: H.265 behind `AppleD5500` and in the kernel (the traces replay register images; MPP's `h265d` parser is not in the core), H.265 Main10, several slices or tiles (libhevc's encoder
 cannot make them), CRA / open GOP, H.264 interlaced, multi-slice and High profile streams (not in the traces), interrupt-driven completion (the replay polls), the IOMMU, the second core and the core combiner, DDR
