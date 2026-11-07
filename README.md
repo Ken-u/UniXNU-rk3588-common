@@ -26,6 +26,7 @@ and [component catalog](https://unixnu.com/reference/components).
 | `scripts/build-rk3588-dvfs.py`, `scripts/data/Rk3588Dvfs/` | Archive step and sources of the frequency and voltage management (see [Frequency management](#frequency-management)) |
 | `scripts/build-rk3588-xhci.py`, `scripts/data/Rk3588Xhci/` | Archive step and sources of the polled xHCI host driver for the DWC3 controllers (see [USB 3 (xHCI)](#usb-3-xhci)) |
 | `scripts/build-rk3588-vdec.py`, `scripts/data/Rk3588Vdec/` | Archive step and sources of the rkvdec2 video decoder bring-up and its self-test (see [Video decoder (rkvdec2)](#video-decoder-rkvdec2)) |
+| `scripts/build-rk3588-rga.py`, `scripts/data/Rk3588Rga/` | Archive step and sources of the RGA3 2D copy block and its IOMMU, used by the video decoder to deliver pictures (see [2D copy (RGA3)](#2d-copy-rga3)) |
 | `kits/` | Reserved for shared platform operations |
 | `tools/board/` | Host-side bring-up tools shared by RK3588 boards: serial capture with times, U-Boot console, USB helpers, reset controller. Not part of the kernel build; see its [README](tools/board/README.md) |
 
@@ -169,12 +170,41 @@ ring buffer; with the patch 248 of 248 VideoToolbox sessions were right (two boo
 
 What a frame costs through VideoToolbox (log level 1, the default; `UniXNU-orangepi5/evidence/device-vdec-perf-20261107.txt`): the service prints a two-line profile when a decoder is destroyed. At 320x240 about 0.3 ms a frame
 in the service (the block 0.07 ms from start to interrupt, the job runner 0.11, the CPU copy of the picture into the surface 0.08), at 1280x720 about 2.2 ms (the block 0.65 ms, the copy 1.2 ms: the copy is now the larger part).
+With the RGA3 doing the copy (`rk3588-rga=5`, [2D copy (RGA3)](#2d-copy-rga3)) a 720p frame is 1.3 ms in the service (the copy 0.34 ms) and a 320x240 frame 0.26 ms.
 The 25 to 300 ms of the first runs were the log-level-2 CRC check above, which used to be on by default. A whole session of ten pictures (first frame in to the last picture out, as the test tool sees it) takes 49 ms at 320x240
 and 147 ms at 720p; the test tool's own copy and CRC of each picture are 8 ms of the first and 82 ms of the second, the rest (the first picture comes 9 to 13 ms after the first frame; the serial log lines; VideoToolbox itself) was not split further. A decoder is reset before it is destroyed, so MPP's `mpp_buf_slot` no longer asserts at the end of the B-frame stream.
 
 Not done: H.265 behind `AppleD5500` and in the kernel (the traces replay register images; MPP's `h265d` parser is not in the core), H.265 Main10, several slices or tiles (libhevc's encoder
 cannot make them), CRA / open GOP, H.264 interlaced, multi-slice and High profile streams (not in the traces), interrupt-driven completion (the replay polls), the IOMMU, the second core and the core combiner, DDR
 bandwidth management, the vendor clock rates.
+
+## 2D copy (RGA3)
+
+`scripts/data/Rk3588Rga/` drives RGA3 core 0 (`0xfdb60000`) as a picture copier for the video decoder. The decoder leaves a picture in its DMA window and the `AppleD5500` service has to put it into an
+IOSurface whose pages are scattered over all of memory (above 4 GiB, so beyond the 32-bit reach of the older RGA2); the CPU did that through uncached memory in 1.1 to 1.2 ms for a 720p picture. RGA3's IOMMU (Rockchip
+IOMMU v2: 40-bit table words) reaches every page of an IOSurface, so the driver owns a page table in a small DMA window of the board's, maps the decoder's window (read-only) and each IOSurface (at `MapPixelBuffer`) into the block's 32-bit
+IO address space, and runs one copy job per picture in slave mode (the CPU writes the 48 command registers, starts the job and polls the raw interrupt register; the interrupt is not used).
+The block only does NV12 to NV12 raster copies with a crop; anything outside its limits (odd offset or size, pitch not a multiple of 16, under 68x2, a plane not 16-byte aligned) is refused with a reason (printed for the first eight) and the caller copies on the CPU, as it
+does when the block reports an error (a page fault, a timeout; the driver then resets the block and brings the IOMMU back with the same tables, and gives the block up after three failures in a row).
+The device builds it with `build-rk3588-rga.py <path>` (compile record of the kernel, `-Werror`, Mach-O audit), force-loads the archive and calls `rk3588_rga_start()` from its probe; its source file defines `rk3588_rga_config` (a window below 4 GiB: the page tables in
+the first 512 KiB, a scratch page that guards the end of every mapping, and the self-test's pictures from 1 MiB on; 8 MiB at least). `Rk3588Vdec` exports `rk3588_vdec_power_pending()`: the RGA3 domain hangs under VDPU and VCODEC, so this driver waits until the decoder's thread has powered them.
+
+| File | Contents |
+| --- | --- |
+| `RkIommu.h` | Header-only, no kernel types: the table-word encoding (address bits 39:36 and 35:32 in bits 7:4 and 11:8), the two-level `PageTables` (directory, then page tables from a pool; refuses double maps, misalignment, addresses over 40 bits), and the register sequences the vendor driver uses (stall, directory address with a pattern readback, force reset, enable paging, interrupt mask, auto-gating bit 31, zap) |
+| `Rga3.h` | Header-only: the register image of a 1:1 NV12 copy (window 0 raster read with scaling bypassed, window 1 off, overlap as a straight copy, write-back with the vendor's outstanding-request limit), the limits check, the job runner (start, poll, clear; give up after a timeout) and the soft reset |
+| `Rk3588Rga.cpp`, `Rk3588Rga.h` | The kernel glue: PMU power domains (VCODEC, VDPU, RGA30), the core clock (nearest PLL divisor not above the target), the resets, the first-fit allocator of IO addresses (every range is followed by four guard pages that map the scratch page), `rk3588_rga_map_physical` / `rk3588_rga_map_memory` / `rk3588_rga_unmap` / `rk3588_rga_copy_nv12`, and the self-tests |
+| `tests/` | `test-rga.cpp` (strict models: memory with regions at address bits 32, 35, 36 and 39..36, the IOMMU with its stall rules, a translation cache that only a zap empties, read-only pages and page faults, and RGA3 reading and writing row by row through it; encoding, tables, the built registers, rejects, copies of six picture shapes into scattered pages, the remap-needs-a-zap rule, a fault, an error bit together with frame-done, a hang) and `run.sh` (4357 checks, ASan and UBSan); `mutate.sh` breaks the headers 32 ways, one at a time, and requires the test to fail each time (all 32 are killed; the first version of the test let two live and could not stop one that hung forever) |
+
+Boot argument `rk3588-rga=N`: 0 off (default); 1 look at the power domains, clocks and PLL rates (nothing is written); 2 also power the block, set its clock, release its resets and read its version and the IOMMU's registers;
+3 also copy test pictures with the IOMMU off (physical addresses inside the window); 4 bring the IOMMU up and copy the test pictures into 64 KiB pieces of kernel memory (physically separate pages) `rk3588-rga-passes=N` times (default 10);
+5 bring it up and leave it ready for the video service; 6 as 4 with one pass, then ready. `rk3588-rga-mhz=N` is the core clock (default 750, cpll / 2, the setting found at boot), `rk3588-rga-fault=1` adds a copy to an unmapped address to mode 4.
+The video service uses the block whenever it is ready (`rk3588-rga=5` or 6) and `rk3588-vdec-d5500-rga=0` is not given; its per-decoder profile then ends with a line `copies: N by the RGA3 (the block ran X us per picture), M by the CPU, K the RGA3 failed on`.
+Measured on the Orange Pi 5 (`UniXNU-orangepi5/evidence/device-rga-20261107.txt`): all six test shapes (320x240, a 304x224 crop with wider pitches, 720p, 720p with padded pitches, 1080p, 68x64) are byte-identical to the model with the IOMMU off and on,
+a copy to an unmapped address stops the block with an error bit and an IOMMU page fault, and one reset later the next copy is right. The block takes about 3.8 pixels per clock: 720p in 615 us at 396 MHz, 411 at 594 and 326 at 750; 1080p 1358, 906 and 720 us.
+Through VideoToolbox a 720p frame's time in the service fell from 2.24 to 1.34 ms (the copy from 1.23 ms to 0.34), 320x240 from 0.30 to 0.27 ms, and the pictures stayed right (128 of 128 sessions with the block at 396 MHz and 128 of 128 in the final configuration at 750 MHz; one other 750 MHz boot lost one session to `videocodecd` being killed by a SIGKILL
+0.3 s after the first session was created, before any picture, which the block had no part in).
+Not done: the second RGA3 core and RGA2, other formats, scaling, rotation and colour conversion (the block can do them; nothing asks), completion by interrupt (SPI 114, shared with the IOMMU), master (command list) mode, quality-of-service settings, a copy that runs while the decoder works on the next frame, other boards.
 
 ## Core order
 
