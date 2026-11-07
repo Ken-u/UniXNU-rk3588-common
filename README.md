@@ -132,17 +132,20 @@ a real controller is a separate question: the board runs answer it (a device rep
 ## Video decoder (rkvdec2)
 
 `scripts/data/Rk3588Vdec/` brings up the RK3588 video decoder block (rkvdec2, "vdpu34x" in Rockchip's MPP; RKVDEC0 at `0xfdc30000`) from the kernel and replays recorded decode jobs
-on it. It is the first step towards hardware H.264 / H.265 decoding for iPadOS and **has no user yet**: nothing in userland talks to it, and the only caller is a self-test. The device
-builds it with `build-rk3588-vdec.py <path>` (the kernel's compile record, `-Werror`, Mach-O audit; the archive embeds `traces/*.vdt`), force-loads it and calls `rk3588_vdec_start()` from a probe.
+on it, and (H.264 only) decodes embedded streams with Rockchip's own parser compiled into the kernel. It is the first step towards hardware H.264 / H.265 decoding for iPadOS and **has no user yet**:
+nothing in userland talks to it, and the only caller is a self-test. The device builds it with `build-rk3588-vdec.py <path>` (the kernel's compile record, `-Werror`, Mach-O audit; the archive embeds
+`traces/*.vdt` and `streams/*.h264`), force-loads it and calls `rk3588_vdec_start()` from a probe.
 The board source defines `rk3588_vdec_config` (the physical address and size of a DMA window below 4 GiB; the block ran in IOMMU bypass, so buffers are addressed physically).
 
 | File | Contents |
 | --- | --- |
 | `VdecTrace.h` | The trace format (`VDT1`), its parser and the player: upload the CPU-written pages, copy the register image with the buffer addresses relocated into the window, clear the output region, write the cache registers, the register runs, then the start register, poll the interrupt register, compare the CRC-32 of the output. Plain C++ over a register accessor and one DMA window |
 | `Rk3588Vdec.cpp`, `Rk3588Vdec.h` | The kernel glue: PMU power domains (VCODEC, VDPU, RKVDEC0 in the vendor driver's order), the clocks (nearest PLL divisors at or below the vendor device tree's 800 / 600 / 1000 MHz), the resets, the mappings (the window through IOKit: the kernel's I/O submap is 8 MiB), the self-test thread |
+| `core/` | The decoder core, plain C: MPP's H.264 parser (`h264d`) and `vdpu34x` register generator (29 files, **not copied**: `fetch_mpp.py` gets the commit pinned in `mpp.lock` and checks a tree hash) behind `MppShim.c` (a replacement for MPP's OS layer: memory, a first-fit buffer pool over the DMA window, the device ioctls as capture of the register image) and `VdecCore.c` (MPP's no-thread decode loop written out linearly). `VdecCore.h` is the API: `vdec_core_decode(bytes, eos, sink)` calls a function with each NV12 picture and a `run` callback with each job. `kernel/` has the libc shim headers and `KernelLibc.c` for the kernel build; the host build is `build-host.sh` |
+| `streams/` | The four H.264 streams the traces were recorded from, with the CRC-32 of each correct picture (display order): what the in-kernel self-test decodes |
 | `traces/` | Recorded jobs of ten streams, 10 pictures each: H.264 at 320x240 (CABAC, CAVLC, with B pictures) and 1280x720 (CABAC); H.265 at 320x240 (plain, with a B pyramid and non-reference B pictures, with default scaling matrices, deblocking off, WPP entry points) and 1280x720 |
 | `tools/` | How the traces are made: `trace-shim.c` (an `LD_PRELOAD` shim that makes unmodified MPP believe it runs on an RK3588 and records every job's registers, buffer relocations and CPU-written pages), `make-trace.py`, `gen-yuv.py`, `make-h264-trace.sh`, `make-h265-trace.sh`, `check-hevc-sei.py` |
-| `tests/` | `test-vdec.cpp` (a strict model of the decoder's registers; parser, player and every committed trace) and `run.sh` (builds and runs it with the sanitizers) |
+| `tests/` | `test-vdec.cpp` (a strict model of the decoder's registers; parser, player and every committed trace) and `run.sh` (builds and runs it with the sanitizers); `test-core.cpp` and `run-core.sh` (the core against `traces/mpp-nt/`, MPP's own recording of the same streams: register images, address registers, CPU-written buffers, picture order, each stream fed whole and in pieces) |
 
 The register images are MPP's own: its H.264 / H.265 parsers and `vdpu34x` register generators run on an x86 host against the shim (MPP at `9b56348`, not modified), and the reference pictures come from libavc
 (AOSP `external/libavc` at `4275faf`: `avcenc` writes the stream and its reconstruction, `avcdec` decodes it again and `make-h264-trace.sh` insists they are byte-equal) and libhevc (AOSP `external/libhevc` at `48cb531`:
@@ -152,9 +155,11 @@ CRCs match); the shim holds a lock around each `ioctl` batch because for H.265 M
 MPP takes its vdpu34x path for H.265 only for that id. libhevc's encoder needs a complete config file (`make-h265-trace.sh` patches libhevc's sample), only the CRC and checksum hash SEI, one IDR, no tiles, slice segment mode off.
 
 Boot argument `rk3588-vdec=N`: 0 off (default); 1 look at the power domains and PLL rates (nothing is written); 2 also power the domains, set the clocks, reset, read the ID and IOMMU registers; 3 also replay
-every embedded trace once and compare; 4 repeat them `rk3588-vdec-passes=N` times (default 20). `rk3588-vdec-dump=1` hex-dumps the picture of the first job that mismatches.
+every embedded trace once and compare; 4 repeat them `rk3588-vdec-passes=N` times (default 20); 5 as 3, then every embedded H.264 stream once through the decoder core and compare each picture's CRC-32;
+6 only the decoder core, `rk3588-vdec-passes=N` times, `rk3588-vdec-chunk=N` feeds the streams in pieces of N bytes. `rk3588-vdec-dump=1` hex-dumps the picture of the first job that mismatches;
+`rk3588-vdec-mpp-log=N` sets MPP's own log level.
 
-Not done: the userland side (AppleD5500 / AppleAVDUserClient on iPadOS: a kernel user client and the parser that makes the register images on the board), H.265 Main10, several slices or tiles (libhevc's encoder
+Not done: the userland side (AppleD5500 / AppleAVDUserClient on iPadOS: a kernel user client over the decoder core), H.265 in the kernel (the traces replay register images; MPP's `h265d` parser is not in the core), H.265 Main10, several slices or tiles (libhevc's encoder
 cannot make them), CRA / open GOP, H.264 interlaced, multi-slice and High profile streams (not in the traces), interrupt-driven completion (the replay polls), the IOMMU, the second core and the core combiner, DDR
 bandwidth management, the vendor clock rates.
 
