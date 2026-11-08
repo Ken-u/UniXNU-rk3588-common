@@ -194,6 +194,8 @@ class Emu:
         if name == 'VTEncoderSessionCreateVideoFormatDescription':
             self.put(a[5], struct.pack('<Q', self.scratch(0x1000)))
             return 0
+        if name in ('CMSampleBufferGetSampleAttachmentsArray', 'CFArrayGetValueAtIndex'):
+            return self.scratch(0x1000)
         if name == 'gettimeofday':
             self.usec += 50000
             self.put(a[0], struct.pack('<QI', 1000 + self.usec // 1000000, self.usec % 1000000))
