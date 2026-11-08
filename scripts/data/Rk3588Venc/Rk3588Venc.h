@@ -36,6 +36,34 @@ extern const struct Rk3588VencConfig rk3588_venc_config;
 // Called by the board's probe once the kernel is up; reads the boot arguments and returns at once without rk3588-venc=N.
 void rk3588_venc_start(void);
 
+// ---- the trace-template encoder behind the AppleAVE2 service (boot argument rk3588-venc-ave2-encode=1 next to rk3588-venc-ave2=1; Rk3588Venc.cpp)
+//
+// The replay in Rk3588Venc.cpp repeats recorded encode jobs; with the source picture replaced it encodes other pictures: a built-in trace of the size and
+// codec asked for is played over and over (its jobs in order, from the first again after the last: for the traces recorded with a closed GOP that means an
+// IDR picture every few frames), the planar 4:2:0 source picture of every job being whatever the caller put into `picture`. The settings are those of the
+// recording (quantiser, GOP, the parameter sets); nothing is rate controlled. One stream at a time uses the block; the DMA window is shared.
+struct Rk3588VencPicture {
+  uint8_t *y, *u, *v;                    // the three planes in the DMA window (write-combined: write them, do not read them back)
+  uint32_t width, height, yStride, uStride;
+};
+struct Rk3588VencResult {
+  const uint8_t *stream;                 // the bit stream of the job as the CPU sees it: what the CPU put in front of the block's start, then the block's bytes
+  uint32_t length;
+  const uint8_t *headers;                // the parameter sets of the trace (Annex B), 0 when the trace has none
+  uint32_t headerLength;
+  uint32_t job;                          // index of the job in the trace
+  uint32_t runUs;                        // time the block took
+};
+struct Rk3588VencStream;
+
+// 1 when the block is powered, reset and its window mapped (the boot arguments rk3588-venc-ave2=2 or rk3588-venc=N did that).
+int rk3588_venc_ready(void);
+// Picks the trace (width x height as the encoder's pictures, hevc 0 / 1); 0 when the block is not ready, a stream is open already or no trace fits. *name is the trace's.
+struct Rk3588VencStream *rk3588_venc_stream_open(uint32_t width, uint32_t height, int hevc, struct Rk3588VencPicture *picture, const char **name);
+void rk3588_venc_stream_close(struct Rk3588VencStream *stream);
+// Encodes the picture now in the DMA window as the next job of the trace; 1 when the block finished it without an error status.
+int rk3588_venc_stream_encode(struct Rk3588VencStream *stream, struct Rk3588VencResult *result);
+
 // Registers the AppleAVE2Driver service (the logging stage, Rk3588VencAve2.cpp) when the boot argument rk3588-venc-ave2=N is set; called by rk3588_venc_start().
 void rk3588_venc_ave2_serve(void);
 

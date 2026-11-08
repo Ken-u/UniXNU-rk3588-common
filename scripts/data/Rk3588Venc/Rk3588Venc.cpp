@@ -74,6 +74,8 @@ volatile uint32_t *gPmu, *gCru;
 volatile uint8_t *gVenc;
 uint8_t *gDma;
 uint32_t gMode;
+bool gReady;           // powered, reset, window mapped (the template encoder may use the block)
+bool gStreamOpen;      // one stream at a time
 
 uint32_t bootArg(const char *name, uint32_t fallback) {
   uint32_t value = fallback;
@@ -407,6 +409,175 @@ bool selfTest(unsigned passes, bool dump) {
   return failed == 0;
 }
 
+// ---- the trace-template encoder (see Rk3588Venc.h)
+IOLock *gStreamLock;
+
+struct StreamImpl {
+  venc::Trace *trace;
+  venc::Player *player;
+  venc::Job *job;
+  const char *name;
+  size_t cursor;
+  uint32_t index;
+  uint32_t srcBuf;
+  uint8_t header[512];
+  uint32_t headerLength;
+};
+
+bool nameHas(const char *name, const char *part) {
+  for (; *name; ++name) {
+    const char *a = name, *b = part;
+    while (*a && *b && *a == *b) ++a, ++b;
+    if (!*b) return true;
+  }
+  return false;
+}
+
+// Where the source picture of the first job is: the three address registers of the encoder's input (adr_src0..2 = registers 160..162).
+bool findPicture(const venc::Job &job, uint32_t *buffer, uint32_t offset[3]) {
+  unsigned found = 0;
+  for (uint32_t i = 0; i < job.relocCount; ++i) {
+    const venc::Reloc &r = job.relocs[i];
+    if (r.reg < 160 || r.reg > 162) continue;
+    if (found && r.buf != *buffer) return false;
+    *buffer = r.buf;
+    offset[r.reg - 160] = r.offset;
+    ++found;
+  }
+  return found == 3;
+}
+
+}  // namespace
+
+extern "C" int rk3588_venc_ready(void) { return gReady; }
+
+extern "C" struct Rk3588VencStream *rk3588_venc_stream_open(uint32_t width, uint32_t height, int hevc, struct Rk3588VencPicture *picture, const char **name) {
+  if (!gReady || !gDma || !picture) return nullptr;
+  if (!gStreamLock) gStreamLock = IOLockAlloc();
+  if (!gStreamLock) return nullptr;
+  IOLockLock(gStreamLock);
+  if (gStreamOpen) {
+    IOLockUnlock(gStreamLock);
+    return nullptr;
+  }
+  StreamImpl *s = static_cast<StreamImpl *>(IOMallocZero(sizeof(StreamImpl)));
+  venc::Trace *trace = static_cast<venc::Trace *>(IOMallocZero(sizeof(venc::Trace)));
+  venc::Player *player = static_cast<venc::Player *>(IOMallocZero(sizeof(venc::Player)));
+  venc::Job *job = static_cast<venc::Job *>(IOMallocZero(sizeof(venc::Job)));
+  bool ok = false;
+  if (s && trace && player && job) {
+    // the preferred trace of a size: the one recorded with a closed GOP of several pictures ("gop"), else the first
+    const unsigned char *best = nullptr;
+    size_t bestSize = 0;
+    const char *bestName = nullptr;
+    for (const auto &t : kVencTraces) {
+      if (nameHas(t.name, "hevc") != (hevc != 0)) continue;
+      if (!trace->parse(t.data, t.size)) continue;
+      if (trace->width() != width || trace->height() != height) continue;
+      if (!best || nameHas(t.name, "gop")) {
+        best = t.data;
+        bestSize = t.size;
+        bestName = t.name;
+      }
+    }
+    if (best && trace->parse(best, bestSize)) {
+      uint32_t buffer = 0, offset[3] = {};
+      size_t cursor = 0;
+      if (trace->job(&cursor, job) && findPicture(*job, &buffer, offset)) {
+        const uint32_t rows = trace->height();
+        const uint32_t yStride = rows ? (offset[1] - offset[0]) / rows : 0, uStride = rows >= 2 ? (offset[2] - offset[1]) / (rows / 2) : 0;
+        if (yStride >= trace->width() && uStride >= trace->width() / 2 && offset[2] + uint64_t(uStride) * (rows / 2) <= trace->bufSize(buffer)) {
+          player->init(blockHw(), trace);
+          if (player->prepare()) {
+            // the parameter sets: what the CPU wrote at the head of the stream buffer before the first job
+            uint32_t extent = 0;
+            if (job->outOffset == 0) {
+              for (uint32_t i = 0; i < job->uploadCount; ++i) {
+                const venc::Upload &u = job->uploads[i];
+                if (u.buf != job->outBuf || u.offset + u.len > sizeof s->header) continue;
+                memcpy(s->header + u.offset, u.data, u.len);
+                if (u.offset + u.len > extent) extent = u.offset + u.len;
+              }
+            }
+            s->trace = trace;
+            s->player = player;
+            s->job = job;
+            s->name = bestName;
+            s->cursor = 0;
+            s->index = 0;
+            s->srcBuf = buffer;
+            s->headerLength = extent;
+            uint8_t *base = gDma + trace->bufOffset(buffer);
+            picture->y = base + offset[0];
+            picture->u = base + offset[1];
+            picture->v = base + offset[2];
+            picture->width = trace->width();
+            picture->height = trace->height();
+            picture->yStride = yStride;
+            picture->uStride = uStride;
+            if (name) *name = bestName;
+            gStreamOpen = true;
+            ok = true;
+          }
+        }
+      }
+    }
+  }
+  IOLockUnlock(gStreamLock);
+  if (!ok) {
+    if (job) IOFree(job, sizeof(venc::Job));
+    if (player) IOFree(player, sizeof(venc::Player));
+    if (trace) IOFree(trace, sizeof(venc::Trace));
+    if (s) IOFree(s, sizeof(StreamImpl));
+    return nullptr;
+  }
+  return reinterpret_cast<Rk3588VencStream *>(s);
+}
+
+extern "C" void rk3588_venc_stream_close(struct Rk3588VencStream *stream) {
+  StreamImpl *s = reinterpret_cast<StreamImpl *>(stream);
+  if (!s) return;
+  IOLockLock(gStreamLock);
+  gStreamOpen = false;
+  IOLockUnlock(gStreamLock);
+  IOFree(s->job, sizeof(venc::Job));
+  IOFree(s->player, sizeof(venc::Player));
+  IOFree(s->trace, sizeof(venc::Trace));
+  IOFree(s, sizeof(StreamImpl));
+}
+
+extern "C" int rk3588_venc_stream_encode(struct Rk3588VencStream *stream, struct Rk3588VencResult *result) {
+  StreamImpl *s = reinterpret_cast<StreamImpl *>(stream);
+  if (!s || !result) return 0;
+  *result = {};
+  IOLockLock(gStreamLock);
+  bool ok = false;
+  if (s->trace->job(&s->cursor, s->job)) {
+    venc::Job &job = *s->job;
+    for (uint32_t i = 0; i < job.uploadCount; ++i)
+      if (job.uploads[i].buf == s->srcBuf) job.uploads[i].len = 0;   // the picture is the caller's, not the recording's
+    venc::JobResult r;
+    ok = s->player->run(job, 500000, &r);
+    result->job = s->index;
+    result->runUs = static_cast<uint32_t>(r.runUs);
+    if (!ok) printf("rk3588-venc: stream %s job %u: FAILED status %#x after %llu us\n", s->name, s->index, r.status, static_cast<unsigned long long>(r.runUs));
+    const uint32_t buffer = s->trace->bufSize(job.outBuf);
+    const uint32_t length = job.outOffset + r.streamLen;
+    result->stream = gDma + s->trace->bufOffset(job.outBuf);
+    result->length = length <= buffer ? length : buffer;
+    result->headers = s->headerLength ? s->header : nullptr;
+    result->headerLength = s->headerLength;
+    if (++s->index >= s->trace->jobCount()) {
+      s->index = 0;
+      s->cursor = 0;
+    }
+  }
+  IOLockUnlock(gStreamLock);
+  return ok;
+}
+
+namespace {
+
 void vencThread(void *, wait_result_t) {
   lookPower();
   if (gMode < 2) return;
@@ -426,6 +597,10 @@ void vencThread(void *, wait_result_t) {
   }
   printf("rk3588-venc: DMA window %#llx, %u bytes, %u traces built in\n", static_cast<unsigned long long>(rk3588_venc_config.dma_phys),
          rk3588_venc_config.dma_bytes, static_cast<unsigned>(sizeof kVencTraces / sizeof kVencTraces[0]));
+  if (gMode == 5) {   // only the AppleAVE2 service uses the block (rk3588-venc-ave2=2): no self-test
+    gReady = true;
+    return;
+  }
   selfTest(gMode == 4 ? bootArg("rk3588-venc-passes", 20) : 1, gMode == 3 || bootArg("rk3588-venc-dump", 0));
   lookBlock();
 }
@@ -435,6 +610,7 @@ void vencThread(void *, wait_result_t) {
 extern "C" void rk3588_venc_start(void) {
   rk3588_venc_ave2_serve();   // its own boot argument (rk3588-venc-ave2): no hardware is touched
   gMode = bootArg("rk3588-venc", 0);
+  if (!gMode && bootArg("rk3588-venc-ave2-encode", 0)) gMode = 5;   // the block for the AppleAVE2 service: powered and mapped, no self-test
   if (!gMode) return;
   printf("rk3588-venc: mode %u\n", gMode);
   vm_offset_t pmuMap = ml_io_map(static_cast<vm_offset_t>(kPmuPhys), 0x400), cruMap = ml_io_map(static_cast<vm_offset_t>(kCruPhys), 0x1000);

@@ -33,6 +33,7 @@ int gLog = 1;
 // the kernel extension carry; entries 8 and 9 are the same family and the same function tables, 9 is the A10X's). Boot argument rk3588-venc-ave2-type.
 uint32_t gDeviceType = 9;
 uint32_t gSessions = 0;
+bool gEncode = false;        // rk3588-venc-ave2-encode=1: the frames are encoded by the block (a trace played with the application's pictures), not made up
 bool gSurfaceOwner = true;   // create the buffers for the client's task (rk3588-venc-ave2-owner=0: for nobody, as the first runs did)
 constexpr unsigned kSelectors = 64;
 
@@ -92,7 +93,10 @@ bool peekUser(task_t task, uint64_t address, void *out, size_t length) {
 // the record). The buffers the plug-in works in are IOSurfaces too, created by the kernel and named in the answer to Start (ids in the record).
 // The IOSurface kext keeps its surfaces in a table indexed by id inside the IOCoreSurfaceRoot service; offsets of the original 21H461 kext (the same the
 // decoder's Surface class uses): surface +16 id, +48 the memory descriptor; root +208 the table, +216 its entry count, +312 the lock (an IOLock *).
-constexpr size_t kRootTable = 208, kRootCount = 216, kRootLock = 312, kSurfId = 16, kSurfMemory = 48;
+// (plus, read the way the decoder's Surface class does: +88 width, +96 height, +104 bytes per row, +128 pixel format, +152 plane count, +384 the plane array of
+// 56-byte elements: height at +8, where the plane starts at +16, bytes per row at +32)
+constexpr size_t kRootTable = 208, kRootCount = 216, kRootLock = 312, kSurfId = 16, kSurfMemory = 48, kSurfWidth = 88, kSurfHeight = 96, kSurfStride = 104,
+                 kSurfFormat = 128, kSurfPlanes = 152, kSurfPlaneArray = 384, kSurfPlaneCount = 392, kPlaneBytes = 56;
 // IOSurfaceRoot::createSurface(root, task = 0, properties) of the original kext: in the kernel cache file it is at 0xfffffff005baaa24 ("mov x3, #0; b ...", a
 // thin wrapper), the original display extension calls it through the GOT slot of its stub. The original kexts are linked into our kernel 0x1000000 lower
 // (the "slide" of kernel.json: the display bindings read 0xfffffff004b9ead0 for the getter at 0xfffffff005b9ead0 of the file), so the function is at
@@ -123,6 +127,11 @@ struct SurfaceMap {
   uint8_t *kva = nullptr;
   uint64_t length = 0;
   uint32_t id = 0;
+  uint32_t format = 0, planes = 0;
+  uint64_t width = 0, height = 0, stride = 0;
+  struct Plane {
+    uint64_t stride, offset, height;
+  } plane[2] = {};
 
   bool valid() const { return kva != nullptr; }
   void release() {
@@ -171,6 +180,27 @@ struct SurfaceMap {
     kva = reinterpret_cast<uint8_t *>(map->getVirtualAddress());
     length = memory->getLength();
     id = surfaceId;
+    width = field<uint64_t>(surface, kSurfWidth);
+    height = field<uint64_t>(surface, kSurfHeight);
+    stride = field<uint64_t>(surface, kSurfStride);
+    format = field<uint32_t>(surface, kSurfFormat);
+    planes = field<uint32_t>(surface, kSurfPlanes);
+    plane[0] = {stride, 0, height};
+    plane[1] = {stride, stride * height, height / 2};
+    const uint8_t *planeArray = field<const uint8_t *>(surface, kSurfPlaneArray);
+    const uint32_t planeCount = field<uint32_t>(surface, kSurfPlaneCount);
+    if (planes == 2 && planeArray && planeCount >= 2 && planeCount <= 4) {
+      const uint64_t p0Stride = field<uint64_t>(planeArray, 32), p1Stride = field<uint64_t>(planeArray, kPlaneBytes + 32);
+      if (p0Stride) plane[0].stride = p0Stride;
+      if (p1Stride) plane[1].stride = p1Stride;
+      const uint64_t p0Height = field<uint64_t>(planeArray, 8), p1Height = field<uint64_t>(planeArray, kPlaneBytes + 8);
+      if (p0Height) plane[0].height = p0Height;
+      if (p1Height) plane[1].height = p1Height;
+      for (unsigned k = 0; k < 2; ++k) {   // where a plane starts: the word at +16 when it is a plausible offset (the decoder's boards showed the first plane need not start at 0)
+        const uint64_t v = field<uint64_t>(planeArray, k * kPlaneBytes + 16);
+        if (v < length && (k == 0 || v >= plane[0].offset + plane[0].stride * plane[0].height)) plane[k].offset = v;
+      }
+    }
     return true;
   }
 };
@@ -316,6 +346,10 @@ class AppleAVE2UserClient : public IOUserClient {
   unsigned receiverDumps = 0;
   uint32_t yuvNotified[32] = {};   // number + 1 of the YUV request answered in each ring position
   void fakeFrame(uint8_t *record);
+  bool encodeFrame(uint8_t *record);   // the block encodes the application's picture (gEncode); false: nothing was written, make one up
+  Rk3588VencStream *encoder = nullptr;
+  Rk3588VencPicture picture = {};
+  unsigned encoded = 0;
   void dumpReceiver();
   bool receiverDumped = false;
   unsigned walkRecords(const char *when, bool dump, uint64_t *numbers, uint32_t *kinds, unsigned room);
@@ -361,6 +395,8 @@ IOReturn AppleAVE2UserClient::clientClose() {
   if (haveCallback) releaseAsyncReference64(asyncReference);
   haveCallback = false;
   ring.release();
+  if (encoder) rk3588_venc_stream_close(encoder);
+  encoder = nullptr;
   if (headerSurface) headerSurface->release();
   headerSurface = nullptr;
   for (auto &set : buffers)
@@ -532,6 +568,171 @@ void AppleAVE2UserClient::fakeFrame(uint8_t *record) {
   block.release();
 }
 
+namespace {
+
+// The Annex B NAL units of a stream: where each starts (at its start code, a zero byte in front of a three-byte one counted into it), where its header byte is, its type.
+struct Nal {
+  uint32_t start, header, end;
+  uint8_t type;
+};
+unsigned splitNals(const uint8_t *p, uint32_t length, Nal *out, unsigned room) {
+  unsigned n = 0;
+  for (uint32_t i = 0; i + 3 < length;) {
+    if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1) {
+      if (n && n <= room) out[n - 1].end = i > out[n - 1].header + 1 && p[i - 1] == 0 ? i - 1 : i;
+      if (n < room) {
+        out[n].start = i > 0 && p[i - 1] == 0 && (n == 0 || i - 1 > out[n - 1].header) ? i - 1 : i;
+        out[n].header = i + 3;
+        out[n].type = p[i + 3] & 0x1f;
+        out[n].end = length;
+      }
+      ++n;
+      i += 3;
+    } else {
+      ++i;
+    }
+  }
+  return n < room ? n : room;
+}
+
+}  // namespace
+
+// What the block wrote for the application's picture, in the places the plug-in's frame-done code reads (see fakeFrame for the layout): the picture is copied
+// from the application's NV12 pixel buffer (the IOSurface whose id is in the request at +0x134) into the planar source picture of the trace, the next job of the
+// trace runs, and its slice NAL units go into the slot's output buffer with a slice record each; the trace's parameter sets go to the header surface.
+bool AppleAVE2UserClient::encodeFrame(uint8_t *record) {
+  const uint32_t slot = field<uint32_t>(record, 0x46c), pixelsId = field<uint32_t>(record, 0x134);
+  if (slot >= kBuffers || !bufferIds[0][slot] || !bufferIds[1][slot] || !headerSurface) return false;
+  SurfaceMap pixels;
+  if (!pixels.open(pixelsId)) {
+    printf("rk3588-venc: ave2:   encode: the pixel buffer (surface %u) cannot be mapped\n", pixelsId);
+    return false;
+  }
+  const uint32_t width = static_cast<uint32_t>(pixels.width), height = static_cast<uint32_t>(pixels.height);
+  const bool nv12 = pixels.planes == 2 && (pixels.format == 0x34323076u || pixels.format == 0x34323066u);   // '420v', '420f'
+  if (!encoded)
+    printf("rk3588-venc: ave2:   encode: pixel buffer surface %u: %ux%u format %#x planes %u, plane 0 offset %llu stride %llu, plane 1 offset %llu stride %llu, %llu bytes\n", pixelsId, width,
+           height, pixels.format, pixels.planes, static_cast<unsigned long long>(pixels.plane[0].offset), static_cast<unsigned long long>(pixels.plane[0].stride),
+           static_cast<unsigned long long>(pixels.plane[1].offset), static_cast<unsigned long long>(pixels.plane[1].stride), static_cast<unsigned long long>(pixels.length));
+  if (!nv12 || (width & 1) || (height & 1)) {
+    printf("rk3588-venc: ave2:   encode: the pixel buffer is not NV12 (format %#x, %u planes)\n", pixels.format, pixels.planes);
+    pixels.release();
+    return false;
+  }
+  if (!encoder) {
+    const char *name = nullptr;
+    encoder = rk3588_venc_stream_open(width, height, 0, &picture, &name);
+    if (!encoder) {
+      printf("rk3588-venc: ave2:   encode: no encoder for %ux%u H.264 (no trace of that size, or the block is not ready)\n", width, height);
+      pixels.release();
+      return false;
+    }
+    printf("rk3588-venc: ave2:   encode: trace %s, source picture %ux%u strides %u/%u\n", name, picture.width, picture.height, picture.yStride, picture.uStride);
+  }
+  if (picture.width != width || picture.height != height) {
+    printf("rk3588-venc: ave2:   encode: the picture is %ux%u, the trace's %ux%u\n", width, height, picture.width, picture.height);
+    pixels.release();
+    return false;
+  }
+  // NV12 -> planar 4:2:0
+  const uint8_t *luma = pixels.kva + pixels.plane[0].offset, *chroma = pixels.kva + pixels.plane[1].offset;
+  if (pixels.plane[0].offset + pixels.plane[0].stride * height > pixels.length || pixels.plane[1].offset + pixels.plane[1].stride * (height / 2) > pixels.length) {
+    printf("rk3588-venc: ave2:   encode: the planes do not fit the surface\n");
+    pixels.release();
+    return false;
+  }
+  for (uint32_t row = 0; row < height; ++row) memcpy(picture.y + static_cast<size_t>(row) * picture.yStride, luma + row * pixels.plane[0].stride, width);
+  for (uint32_t row = 0; row < height / 2; ++row) {
+    const uint8_t *in = chroma + row * pixels.plane[1].stride;
+    uint8_t *u = picture.u + static_cast<size_t>(row) * picture.uStride, *v = picture.v + static_cast<size_t>(row) * picture.uStride;
+    for (uint32_t col = 0; col < width / 2; ++col) {
+      u[col] = in[2 * col];
+      v[col] = in[2 * col + 1];
+    }
+  }
+  pixels.release();
+  Rk3588VencResult result;
+  const bool ok = rk3588_venc_stream_encode(encoder, &result);
+  if (!ok || !result.stream || !result.length) return false;
+  Nal nals[32];
+  const unsigned count = splitNals(result.stream, result.length, nals, 32);
+  SurfaceMap out, block, header;
+  if (!out.open(bufferIds[0][slot]) || !block.open(bufferIds[1][slot]) || !header.open(headerId)) {
+    printf("rk3588-venc: ave2:   encode: cannot map the buffers of slot %u\n", slot);
+    out.release();
+    block.release();
+    header.release();
+    return false;
+  }
+  // The parameter sets: the trace's (what MPP wrote in front of the first job); a stream that carries its own wins.
+  const uint8_t *sets = result.headers;
+  uint32_t setBytes = result.headerLength;
+  uint8_t own[512];
+  uint32_t ownBytes = 0;
+  uint32_t slices = 0, written = 0;
+  const uint8_t kStartCode[4] = {0, 0, 0, 1};
+  uint32_t sliceSize[31] = {};
+  bool idr = false;
+  for (unsigned i = 0; i < count && slices < 31; ++i) {
+    const uint32_t size = nals[i].end - nals[i].start, startSize = nals[i].header - nals[i].start;
+    if (nals[i].type == 7 || nals[i].type == 8) {
+      if (ownBytes + 4 + size - startSize <= sizeof own) {
+        memcpy(own + ownBytes, kStartCode, 4);
+        memcpy(own + ownBytes + 4, result.stream + nals[i].header, size - startSize);
+        ownBytes += 4 + size - startSize;
+      }
+      continue;
+    }
+    if (nals[i].type != 1 && nals[i].type != 5) continue;
+    if (written + size > out.length) break;
+    memcpy(out.kva + written, result.stream + nals[i].start, size);
+    written += size;
+    sliceSize[slices] = size;
+    idr |= nals[i].type == 5;
+    ++slices;
+  }
+  if (ownBytes) {
+    sets = own;
+    setBytes = ownBytes;
+  }
+  if (!slices || !sets || !setBytes || setBytes > header.length) {
+    printf("rk3588-venc: ave2:   encode: job %u gave %u NAL units, %u slices, %u bytes of parameter sets\n", result.job, count, slices, setBytes);
+    out.release();
+    block.release();
+    header.release();
+    return false;
+  }
+  memcpy(header.kva, sets, setBytes);
+  const uint32_t headerBits = setBytes * 8;
+  memcpy(block.kva + 0x98, &headerBits, sizeof headerBits);
+  memcpy(record + 0x5528, &headerBits, sizeof headerBits);
+  memcpy(block.kva + 0xf0, &slices, sizeof slices);
+  const uint64_t fillerPrefix = 0;
+  const uint32_t fillerBytes = 0;
+  memcpy(block.kva + 0xf4, &fillerPrefix, sizeof fillerPrefix);
+  memcpy(block.kva + 0xfc, &fillerBytes, sizeof fillerBytes);
+  for (uint32_t i = 0; i <= slices && i < 32; ++i) {
+    uint8_t *entry = block.kva + 0x180 + static_cast<size_t>(i) * 0x220;
+    const uint32_t size = i < slices ? sliceSize[i] : 0;
+    memcpy(entry, &size, sizeof size);
+    // Byte +0x20c is how many bytes the plug-in leaves off the end of the slice (it copies size - that from the buffer, replaces the start code with the NAL's length
+    // and appends 00 00 03): with the NAL's own header size here the last four bytes of every slice were lost (board run ave29, host emulation of the handler), so 0.
+    entry[0x20c] = 0;
+  }
+  // The frame type the plug-in logs and builds its sample's attachments from, at +0x5b34 of the record (found by running its handler on the host with 0..3 there):
+  // 3 is an IDR picture (a sync sample, an I frame), 0 an I picture that is not an IDR, 1 a P picture, 2 a B picture.
+  const uint32_t frameType = idr ? 3 : 1;
+  memcpy(record + 0x5b34, &frameType, sizeof frameType);
+  if (encoded < 8 || (encoded & 31) == 0)
+    printf("rk3588-venc: ave2:   encode: frame %u: job %u, %u bytes from the block in %u us: %u NAL units, %u slices (%u bytes), %u bytes of parameter sets\n", encoded, result.job, result.length,
+           result.runUs, count, slices, written, setBytes);
+  ++encoded;
+  out.release();
+  block.release();
+  header.release();
+  return true;
+}
+
 // The whole frame receiver of the plug-in (the object its notification handler works on), read in pieces and printed as the rows that are not zero: this is what
 // the handler's code can be run against on the host. A piece that cannot be read ends the dump.
 void AppleAVE2UserClient::dumpReceiver() {
@@ -587,7 +788,8 @@ void AppleAVE2UserClient::completePending(const char *when, bool dump) {
       const unsigned position = static_cast<unsigned>(numbers[i] % 32);
       if (yuvNotified[position] == numbers[i] + 1) continue;
       yuvNotified[position] = static_cast<uint32_t>(numbers[i] + 1);
-      fakeFrame(ring.kva + static_cast<size_t>(position) * 0x10630);
+      uint8_t *yuvRecord = ring.kva + static_cast<size_t>(position) * 0x10630;
+      if (!gEncode || !encodeFrame(yuvRecord)) fakeFrame(yuvRecord);
       if (!receiverDumped) {
         receiverDumped = true;
         dumpReceiver();
@@ -719,6 +921,7 @@ extern "C" void rk3588_venc_ave2_serve(void) {
   if (gLog <= 0) return;
   if (PE_parse_boot_argn("rk3588-venc-ave2-type", &value, sizeof value)) gDeviceType = value;
   if (PE_parse_boot_argn("rk3588-venc-ave2-owner", &value, sizeof value)) gSurfaceOwner = value != 0;
+  if (PE_parse_boot_argn("rk3588-venc-ave2-encode", &value, sizeof value)) gEncode = value != 0;
   AppleAVE2Driver *service = OSTypeAlloc(AppleAVE2Driver);
   if (!service || !service->init() || !service->attach(IOService::getResourceService()) || !service->start(IOService::getResourceService())) {
     printf("rk3588-venc: ave2: could not make the service\n");

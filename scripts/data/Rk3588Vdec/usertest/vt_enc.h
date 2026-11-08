@@ -37,6 +37,21 @@ static void hex_line(const char *what, const uint8_t *p, size_t n)
    say("vt-enc: %s: %s", what, line);
 }
 
+/* Bytes for the host: `vt-enc: data NAME OFFSET HEX` rows of 32 bytes (tools/check-vt-enc.py puts them back together and decodes them). */
+static void hex_dump(const char *name, const uint8_t *p, size_t n)
+{
+   static const char digits[] = "0123456789abcdef";
+   for (size_t off = 0; off < n; off += 32) {
+      char line[65] = {};
+      size_t k = 0;
+      for (size_t i = 0; i < 32 && off + i < n; ++i) {
+         line[k++] = digits[p[off + i] >> 4];
+         line[k++] = digits[p[off + i] & 15];
+      }
+      say("vt-enc: data %s %06zx %s", name, off, line);
+   }
+}
+
 static void enc_output(void *refcon, void *frameRefcon, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sample)
 {
    struct enc_state *st = refcon;
@@ -62,6 +77,16 @@ static void enc_output(void *refcon, void *frameRefcon, OSStatus status, VTEncod
           (unsigned)flags);
    if (st->frames < 2)
       hex_line("sample head", head, length);
+   if (st->frames < 8 && block && length && length <= (1u << 20)) {
+      uint8_t *all = malloc(length);
+      if (all && CMBlockBufferCopyDataBytes(block, 0, length, all) == noErr) {
+         char name[24];
+         snprintf(name, sizeof name, "sample%u%s", st->frames, key ? "k" : "");
+         hex_dump(name, all, length);
+         hex_dump(name, all, length);   /* twice: the kernel's own log lines can cut into a row, the checker takes the union */
+      }
+      free(all);
+   }
    if (!st->described) {
       st->described = 1;
       CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sample);
@@ -75,6 +100,15 @@ static void enc_output(void *refcon, void *frameRefcon, OSStatus status, VTEncod
          say("vt-enc: format %dx%d, H.264 parameter sets: status %d, %zu sets, NAL length %d", dim.width, dim.height, (int)ps, count, nal);
          if (ps == noErr && set)
             hex_line("first parameter set", set, setSize);
+         for (size_t k = 0; k < count && k < 4; ++k) {
+            const uint8_t *one = NULL;
+            size_t oneSize = 0;
+            char name[16];
+            if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, k, &one, &oneSize, NULL, NULL) == noErr && one) {
+               snprintf(name, sizeof name, "set%zu", k);
+               hex_dump(name, one, oneSize);
+            }
+         }
       }
    }
    st->frames++;
