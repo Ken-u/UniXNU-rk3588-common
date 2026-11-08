@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-"""Decode what VideoToolbox's hardware H.264 encoder delivered on the board and compare it with the pictures the test program gave it.
+"""Decode what VideoToolbox's hardware H.264 (or, with --codec h265, H.265) encoder delivered on the board and compare it with the pictures the test program gave it.
 
-    check-vt-enc.py SERIAL.log --decoder PATH-TO-avcdec [--width 640] [--height 360] [--frames 5] [--min-psnr 30] [--keep DIR]
+    check-vt-enc.py SERIAL.log --decoder PATH-TO-avcdec|hevcdec [--codec h264|h265] [--width 640] [--height 360] [--frames 5] [--min-psnr 30] [--keep DIR]
 
 The test program (Rk3588Vdec/usertest/vt_enc.h) prints every compressed sample of the first H.264 session and the session's parameter sets as rows
-    vt-enc: data NAME OFFSET HEX            (NAME: set0, set1, sample0, sample1k ... ; "k" = the sample was marked sync)
+    vt-enc: data NAME OFFSET HEX            (NAME: set0, set1, sample0, sample1k ... ; "k" = the sample was marked sync; an H.265 session's names start with h265_, its sets are VPS, SPS, PPS)
 The samples are in the length-prefixed form of the MP4 world (4-byte NAL lengths); this puts them back into an Annex B stream with the parameter sets in front, has
 libavc's avcdec decode it and compares picture N with the picture the test generated for frame N (fill_nv12 of vt_enc.h, rebuilt here) as planar 4:2:0: PSNR of
 luma and both chroma planes. The encoder is lossy (a trace's fixed quantiser), so this is a check against garbage and the wrong picture, not against equality.
@@ -43,7 +43,8 @@ def source_picture(width, height, frame):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('log', type=Path)
-    ap.add_argument('--decoder', required=True, type=Path, help='libavc avcdec')
+    ap.add_argument('--decoder', required=True, type=Path, help='libavc avcdec, or libhevc hevcdec with --codec h265')
+    ap.add_argument('--codec', choices=('h264', 'h265'), default='h264')
     ap.add_argument('--width', type=int, default=640)
     ap.add_argument('--height', type=int, default=360)
     ap.add_argument('--frames', type=int, default=5)
@@ -67,12 +68,13 @@ def main():
             data += have[offset]
         return bytes(data)
 
-    samples = sorted((int(re.match(r'sample(\d+)', n).group(1)), n) for n in chunks if n.startswith('sample'))
+    prefix = 'h265_' if args.codec == 'h265' else ''
+    samples = sorted((int(re.match(prefix + r'sample(\d+)', n).group(1)), n) for n in chunks if n.startswith(prefix + 'sample'))
     if len(samples) < args.frames:
         sys.exit('the log has %d samples, %d expected' % (len(samples), args.frames))
     start = b'\x00\x00\x00\x01'
     stream = bytearray()
-    for name in ('set0', 'set1'):
+    for name in (prefix + 'set0', prefix + 'set1', prefix + 'set2'):
         if name in chunks:
             stream += start + blob(name)
     for index, name in samples[:args.frames]:
@@ -84,7 +86,7 @@ def main():
             nal = data[at + 4:at + 4 + n]
             if n == 0 or at + 4 + n > len(data):
                 sys.exit('%s: bad NAL length %d at %d of %d' % (name, n, at, len(data)))
-            types.append(nal[0] & 0x1f)
+            types.append((nal[0] >> 1) & 0x3f if args.codec == 'h265' else nal[0] & 0x1f)
             stream += start + nal
             at += 4 + n
         print('%s: %d bytes, NAL types %s' % (name, len(data), types))
@@ -92,10 +94,13 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         work = (args.keep or Path(tmp)).resolve()
         work.mkdir(parents=True, exist_ok=True)
-        (work / 'vt.h264').write_bytes(stream)
-        (work / 'vt.dec.cfg').write_text('--input %s\n--save_output 1\n--num_frames -1\n--output %s\n--chroma_format YUV_420P\n--share_display_buf 0\n--num_cores 1\n'
-                                         '--loopback 0\n--display 0\n--arch X86_GENERIC\n--soc GENERIC\n--fps 30\n' % (work / 'vt.h264', work / 'vt.dec.yuv'))
-        subprocess.run([str(args.decoder), '--config', str(work / 'vt.dec.cfg')], stdout=subprocess.DEVNULL, check=True)
+        extension = '.265' if args.codec == 'h265' else '.h264'
+        (work / ('vt' + extension)).write_bytes(stream)
+        text = '--input %s\n--save_output 1\n--num_frames -1\n--output %s\n--chroma_format YUV_420P\n--share_display_buf 0\n--num_cores 1\n' \
+               '--loopback 0\n--display 0\n--arch X86_GENERIC\n--soc GENERIC\n' % (work / ('vt' + extension), work / 'vt.dec.yuv')
+        text += '--max_wd 4096\n--max_ht 2304\n--max_level 62\n' if args.codec == 'h265' else '--fps 30\n'
+        (work / 'vt.dec.cfg').write_text(text)
+        subprocess.run([str(args.decoder)] + (['-c'] if args.codec == 'h265' else ['--config']) + [str(work / 'vt.dec.cfg')], stdout=subprocess.DEVNULL, check=True)
         decoded = (work / 'vt.dec.yuv').read_bytes()
 
     frame = args.width * args.height * 3 // 2

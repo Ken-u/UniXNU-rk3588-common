@@ -18,6 +18,7 @@ struct enc_state {
    uint64_t firstUs;
    int described;
    uint32_t crc;
+   int hevc;   /* the session's codec: the data rows of an H.265 session are named h265_... */
 };
 
 static int enc_wanted(void)
@@ -80,8 +81,8 @@ static void enc_output(void *refcon, void *frameRefcon, OSStatus status, VTEncod
    if (st->frames < 8 && block && length && length <= (1u << 20)) {
       uint8_t *all = malloc(length);
       if (all && CMBlockBufferCopyDataBytes(block, 0, length, all) == noErr) {
-         char name[24];
-         snprintf(name, sizeof name, "sample%u%s", st->frames, key ? "k" : "");
+         char name[32];
+         snprintf(name, sizeof name, "%ssample%u%s", st->hevc ? "h265_" : "", st->frames, key ? "k" : "");
          hex_dump(name, all, length);
          hex_dump(name, all, length);   /* twice: the kernel's own log lines can cut into a row, the checker takes the union */
       }
@@ -96,16 +97,19 @@ static void enc_output(void *refcon, void *frameRefcon, OSStatus status, VTEncod
          int nal = 0;
          const uint8_t *set = NULL;
          size_t setSize = 0;
-         OSStatus ps = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, 0, &set, &setSize, &count, &nal);
-         say("vt-enc: format %dx%d, H.264 parameter sets: status %d, %zu sets, NAL length %d", dim.width, dim.height, (int)ps, count, nal);
+         OSStatus ps = st->hevc ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format, 0, &set, &setSize, &count, &nal)
+                                : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, 0, &set, &setSize, &count, &nal);
+         say("vt-enc: format %dx%d, %s parameter sets: status %d, %zu sets, NAL length %d", dim.width, dim.height, st->hevc ? "H.265" : "H.264", (int)ps, count, nal);
          if (ps == noErr && set)
             hex_line("first parameter set", set, setSize);
          for (size_t k = 0; k < count && k < 4; ++k) {
             const uint8_t *one = NULL;
             size_t oneSize = 0;
-            char name[16];
-            if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, k, &one, &oneSize, NULL, NULL) == noErr && one) {
-               snprintf(name, sizeof name, "set%zu", k);
+            char name[24];
+            OSStatus got = st->hevc ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format, k, &one, &oneSize, NULL, NULL)
+                                    : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, k, &one, &oneSize, NULL, NULL);
+            if (got == noErr && one) {
+               snprintf(name, sizeof name, "%sset%zu", st->hevc ? "h265_" : "", k);
                hex_dump(name, one, oneSize);
             }
          }
@@ -143,6 +147,7 @@ static int run_encode(CMVideoCodecType codec, unsigned width, unsigned height, u
    CFDictionarySetValue(spec, require ? kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder : kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
                         kCFBooleanTrue);
    struct enc_state st = {};
+   st.hevc = codec == kCMVideoCodecType_HEVC;
    VTCompressionSessionRef session = NULL;
    uint64_t t0 = now_ms();
    OSStatus status = VTCompressionSessionCreate(kCFAllocatorDefault, (int32_t)width, (int32_t)height, codec, spec, NULL, NULL, enc_output, &st, &session);

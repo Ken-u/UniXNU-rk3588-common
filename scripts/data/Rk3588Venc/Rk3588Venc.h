@@ -53,6 +53,7 @@ struct Rk3588VencResult {
   uint32_t headerLength;
   uint32_t job;                          // index of the job in the trace
   uint32_t runUs;                        // time the block took
+  uint32_t hwOffset;                     // where in the stream the block's own bytes begin: what is in front of it was written by the CPU for the recording and is stale when replayed
 };
 struct Rk3588VencStream;
 

@@ -350,6 +350,8 @@ class AppleAVE2UserClient : public IOUserClient {
   Rk3588VencStream *encoder = nullptr;
   Rk3588VencPicture picture = {};
   unsigned encoded = 0;
+  uint32_t codec = 1;   // 1 = H.264, 2 = H.265: word +0x10 of the Open call's structure is 0 for the H.264 plug-in and 1 for the H.265 one (the same word of the Prepare / Start
+                        // descriptor is the client number the Open answer gave: a first reading took it for the codec and only got the test program's two sessions right)
   void dumpReceiver();
   bool receiverDumped = false;
   unsigned walkRecords(const char *when, bool dump, uint64_t *numbers, uint32_t *kinds, unsigned room);
@@ -575,7 +577,7 @@ struct Nal {
   uint32_t start, header, end;
   uint8_t type;
 };
-unsigned splitNals(const uint8_t *p, uint32_t length, Nal *out, unsigned room) {
+unsigned splitNals(const uint8_t *p, uint32_t length, Nal *out, unsigned room, bool hevc) {
   unsigned n = 0;
   for (uint32_t i = 0; i + 3 < length;) {
     if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1) {
@@ -583,7 +585,7 @@ unsigned splitNals(const uint8_t *p, uint32_t length, Nal *out, unsigned room) {
       if (n < room) {
         out[n].start = i > 0 && p[i - 1] == 0 && (n == 0 || i - 1 > out[n - 1].header) ? i - 1 : i;
         out[n].header = i + 3;
-        out[n].type = p[i + 3] & 0x1f;
+        out[n].type = hevc ? (p[i + 3] >> 1) & 0x3f : p[i + 3] & 0x1f;   // H.265: six bits after the forbidden zero bit of a two-byte header
         out[n].end = length;
       }
       ++n;
@@ -621,9 +623,9 @@ bool AppleAVE2UserClient::encodeFrame(uint8_t *record) {
   }
   if (!encoder) {
     const char *name = nullptr;
-    encoder = rk3588_venc_stream_open(width, height, 0, &picture, &name);
+    encoder = rk3588_venc_stream_open(width, height, codec == 2, &picture, &name);
     if (!encoder) {
-      printf("rk3588-venc: ave2:   encode: no encoder for %ux%u H.264 (no trace of that size, or the block is not ready)\n", width, height);
+      printf("rk3588-venc: ave2:   encode: no encoder for %ux%u %s (no trace of that size, or the block is not ready)\n", width, height, codec == 2 ? "H.265" : "H.264");
       pixels.release();
       return false;
     }
@@ -655,7 +657,8 @@ bool AppleAVE2UserClient::encodeFrame(uint8_t *record) {
   const bool ok = rk3588_venc_stream_encode(encoder, &result);
   if (!ok || !result.stream || !result.length) return false;
   Nal nals[32];
-  const unsigned count = splitNals(result.stream, result.length, nals, 32);
+  const bool hevc = codec == 2;
+  const unsigned count = splitNals(result.stream, result.length, nals, 32, hevc);
   SurfaceMap out, block, header;
   if (!out.open(bufferIds[0][slot]) || !block.open(bufferIds[1][slot]) || !header.open(headerId)) {
     printf("rk3588-venc: ave2:   encode: cannot map the buffers of slot %u\n", slot);
@@ -675,7 +678,8 @@ bool AppleAVE2UserClient::encodeFrame(uint8_t *record) {
   bool idr = false;
   for (unsigned i = 0; i < count && slices < 31; ++i) {
     const uint32_t size = nals[i].end - nals[i].start, startSize = nals[i].header - nals[i].start;
-    if (nals[i].type == 7 || nals[i].type == 8) {
+    const bool parameterSet = hevc ? nals[i].type >= 32 && nals[i].type <= 34 : nals[i].type == 7 || nals[i].type == 8;   // H.265: VPS, SPS, PPS
+    if (parameterSet) {
       if (ownBytes + 4 + size - startSize <= sizeof own) {
         memcpy(own + ownBytes, kStartCode, 4);
         memcpy(own + ownBytes + 4, result.stream + nals[i].header, size - startSize);
@@ -683,12 +687,13 @@ bool AppleAVE2UserClient::encodeFrame(uint8_t *record) {
       }
       continue;
     }
-    if (nals[i].type != 1 && nals[i].type != 5) continue;
+    const bool slice = hevc ? nals[i].type <= 9 || (nals[i].type >= 16 && nals[i].type <= 21) : nals[i].type == 1 || nals[i].type == 5;
+    if (!slice || nals[i].start < result.hwOffset) continue;   // bytes in front of where the block began writing are the recording's CPU-written head (stale here)
     if (written + size > out.length) break;
     memcpy(out.kva + written, result.stream + nals[i].start, size);
     written += size;
     sliceSize[slices] = size;
-    idr |= nals[i].type == 5;
+    idr |= hevc ? nals[i].type >= 16 && nals[i].type <= 21 : nals[i].type == 5;
     ++slices;
   }
   if (ownBytes) {
@@ -898,6 +903,8 @@ IOReturn AppleAVE2UserClient::externalMethod(uint32_t selector, IOExternalMethod
     printf("rk3588-venc: ave2:   -> device type %u, client %u\n", reply[0], reply[1]);
     if (args->structureInputSize >= 0x18) {
       const uint32_t ringId = field<uint32_t>(args->structureInput, 0x14);
+      codec = field<uint32_t>(args->structureInput, 0x10) == 1 ? 2 : 1;
+      printf("rk3588-venc: ave2:   codec %s\n", codec == 2 ? "H.265" : "H.264");
       ring.release();
       const bool ok = ring.open(ringId);
       printf("rk3588-venc: ave2:   record ring = IOSurface %u: %s (%llu bytes)\n", ringId, ok ? "mapped" : "not found", static_cast<unsigned long long>(ring.length));

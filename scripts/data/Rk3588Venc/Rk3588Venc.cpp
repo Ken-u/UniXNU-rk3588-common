@@ -565,6 +565,7 @@ extern "C" int rk3588_venc_stream_encode(struct Rk3588VencStream *stream, struct
     const uint32_t length = job.outOffset + r.streamLen;
     result->stream = gDma + s->trace->bufOffset(job.outBuf);
     result->length = length <= buffer ? length : buffer;
+    result->hwOffset = job.outOffset;
     result->headers = s->headerLength ? s->header : nullptr;
     result->headerLength = s->headerLength;
     if (++s->index >= s->trace->jobCount()) {
