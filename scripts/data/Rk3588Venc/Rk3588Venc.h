@@ -21,7 +21,8 @@
 // comparing every pass's bit stream with the first's (add rk3588-venc-dump=1 to print the stream of the first pass too); 5 only powers, clocks and maps the block
 // for the AppleAVE2 service (rk3588-venc-ave2-encode=1 does that without this argument); 6 runs the self-test of the encoder core (core/, Rk3588VencCore.cpp: MPP's
 // own H.264 encoder over pictures made here, sizes and rates that were never recorded), printing a line per picture and, with rk3588-venc-core-dump=1, its bytes
-// for tools/check-core-output.py; rk3588-venc-core-log=N lets MPP's own messages through up to level N (default 3).
+// for tools/check-core-output.py; rk3588-venc-core-log=N lets MPP's own messages through up to level N (default 3). After the self-test the block stays powered and
+// the window mapped for the AppleAVE2 service (rk3588-venc-ave2-encode=2: the core encodes the application's pictures; =1: the traces' template encoder).
 #pragma once
 #include <stdint.h>
 
@@ -76,6 +77,40 @@ void rk3588_venc_core_read_regs(void *ctx, uint32_t byteOffset, uint32_t *dst, u
 void rk3588_venc_core_window(uint8_t **virt, uint64_t *bus, uint32_t *bytes);
 // The self-test of the encoder core (boot argument rk3588-venc=6), run by the driver thread once the block is up.
 void rk3588_venc_core_selftest(void);
+
+// ---- the encoder core behind the AppleAVE2 service (boot argument rk3588-venc-ave2-encode=2; Rk3588VencCore.cpp)
+//
+// H.264 pictures of any size, at the bit rate and with the key-frame interval the application asked for: MPP's encoder (core/) instead of a recording's trace.
+// One stream at a time, and it shares the block and the DMA window with the template encoder above (rk3588_venc_window_claim). The core runs on a thread of
+// its own (16 KiB of kernel stack, almost all of it the core's: it goes about 5 KiB deep), the calls below wait for it.
+struct Rk3588VencCoreSettings {
+  uint32_t width, height;     // the visible picture; even
+  uint32_t bitrate;           // bit/s, constant bit rate; 0: a fixed quantiser (QP 28)
+  uint32_t fpsNum, fpsDen;    // 0: 30 / 1
+  uint32_t gop;               // pictures between IDR pictures; 0: two seconds' worth
+};
+struct Rk3588VencCoreSource {
+  uint8_t *y;                 // the NV12 source picture, in the DMA window (write-combined: write it, do not read it back): `yStride` bytes per row, `vStride` rows of luma, then
+  uint8_t *uv;                // the interleaved chroma at `uv`, `yStride` bytes per row too
+  uint32_t yStride, vStride;
+};
+struct Rk3588VencCoreResult {
+  const uint8_t *data;        // Annex B, valid until the next encode call: the parameter sets (SPS, PPS) in front of an IDR picture, then the slice(s)
+  uint32_t length;
+  int isIdr;
+  int qp;                     // what the block reported
+  uint32_t totalUs;           // the whole call, and the part of it the block took
+  uint32_t blockUs;
+};
+struct Rk3588VencCoreStream;
+
+// 1 when the block and the window are free and the core could be set up; the block is claimed from here to rk3588_venc_core_close.
+int rk3588_venc_window_claim(void);
+void rk3588_venc_window_release(void);
+struct Rk3588VencCoreStream *rk3588_venc_core_open(const struct Rk3588VencCoreSettings *settings, struct Rk3588VencCoreSource *source);
+void rk3588_venc_core_close(struct Rk3588VencCoreStream *stream);
+// Encodes the picture now in the source buffer; 1 on success. `forceIdr`: make it an IDR picture.
+int rk3588_venc_core_encode(struct Rk3588VencCoreStream *stream, int64_t pts, int forceIdr, struct Rk3588VencCoreResult *result);
 
 // Registers the AppleAVE2Driver service (the logging stage, Rk3588VencAve2.cpp) when the boot argument rk3588-venc-ave2=N is set; called by rk3588_venc_start().
 void rk3588_venc_ave2_serve(void);

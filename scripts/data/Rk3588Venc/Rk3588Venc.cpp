@@ -452,6 +452,25 @@ bool findPicture(const venc::Job &job, uint32_t *buffer, uint32_t offset[3]) {
 
 extern "C" int rk3588_venc_ready(void) { return gReady; }
 
+// The block and the window belong to one stream at a time, whichever encoder it is (the template encoder's or the core's).
+extern "C" int rk3588_venc_window_claim(void) {
+  if (!gReady || !gDma) return 0;
+  if (!gStreamLock) gStreamLock = IOLockAlloc();
+  if (!gStreamLock) return 0;
+  IOLockLock(gStreamLock);
+  const bool free = !gStreamOpen;
+  if (free) gStreamOpen = true;
+  IOLockUnlock(gStreamLock);
+  return free;
+}
+
+extern "C" void rk3588_venc_window_release(void) {
+  if (!gStreamLock) return;
+  IOLockLock(gStreamLock);
+  gStreamOpen = false;
+  IOLockUnlock(gStreamLock);
+}
+
 extern "C" struct Rk3588VencStream *rk3588_venc_stream_open(uint32_t width, uint32_t height, int hevc, struct Rk3588VencPicture *picture, const char **name) {
   if (!gReady || !gDma || !picture) return nullptr;
   if (!gStreamLock) gStreamLock = IOLockAlloc();
@@ -650,6 +669,7 @@ void vencThread(void *, wait_result_t) {
   if (gMode == 6) {   // the encoder core made of MPP's code (no traces): Rk3588VencCore.cpp
     rk3588_venc_core_selftest();
     lookBlock();
+    gReady = true;   // the block is powered, reset and its window mapped: the AppleAVE2 service may use it from here
     return;
   }
   selfTest(gMode == 4 ? bootArg("rk3588-venc-passes", 20) : 1, gMode == 3 || bootArg("rk3588-venc-dump", 0));

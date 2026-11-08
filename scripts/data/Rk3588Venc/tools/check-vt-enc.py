@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 """Decode what VideoToolbox's hardware H.264 (or, with --codec h265, H.265) encoder delivered on the board and compare it with the pictures the test program gave it.
 
-    check-vt-enc.py SERIAL.log --decoder PATH-TO-avcdec|hevcdec [--codec h264|h265] [--width 640] [--height 360] [--frames 5] [--min-psnr 30] [--keep DIR]
+    check-vt-enc.py SERIAL.log --decoder PATH-TO-avcdec|hevcdec [--codec h264|h265] [--width 640] [--height 360] [--frames 5] [--min-psnr 30] [--tag k_] [--keep DIR]
 
 The test program (Rk3588Vdec/usertest/vt_enc.h) prints every compressed sample of the first H.264 session and the session's parameter sets as rows
     vt-enc: data NAME OFFSET HEX            (NAME: set0, set1, sample0, sample1k ... ; "k" = the sample was marked sync; an H.265 session's names start with h265_, its sets are VPS, SPS, PPS)
@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 
@@ -49,15 +50,26 @@ def main():
     ap.add_argument('--height', type=int, default=360)
     ap.add_argument('--frames', type=int, default=5)
     ap.add_argument('--min-psnr', type=float, default=30.0)
+    ap.add_argument('--tag', default='', help='the session to check: the prefix of its data rows (the settings struct of the session in vt_enc.h)')
     ap.add_argument('--keep', type=Path)
     args = ap.parse_args()
 
     row_re = re.compile(r'vt-enc: data (\w+) ([0-9a-f]{6}) ([0-9a-f]+)\s*$')
-    chunks = {}
+    # Every sample is dumped several times (two passes, and the dump itself is printed twice), and the serial line can lose
+    # or mix characters when two threads print at once: for each row the copy that most of the copies agree on is used.
+    votes = {}
     for raw in args.log.read_text(errors='replace').splitlines():
         m = row_re.search(raw)
-        if m:
-            chunks.setdefault(m.group(1), {}).setdefault(int(m.group(2), 16), bytes.fromhex(m.group(3)))
+        if m and len(m.group(3)) % 2 == 0:
+            votes.setdefault((m.group(1), int(m.group(2), 16)), Counter())[bytes.fromhex(m.group(3))] += 1
+    chunks = {}
+    damaged = 0
+    for (name, offset), copies in votes.items():
+        best, n = copies.most_common(1)[0]
+        damaged += sum(copies.values()) - n
+        chunks.setdefault(name, {})[offset] = best
+    if damaged:
+        print(f'{damaged} damaged copies of data rows in the log outvoted')
 
     def blob(name):
         have = chunks[name]
@@ -68,7 +80,7 @@ def main():
             data += have[offset]
         return bytes(data)
 
-    prefix = 'h265_' if args.codec == 'h265' else ''
+    prefix = args.tag + ('h265_' if args.codec == 'h265' else '')
     samples = sorted((int(re.match(prefix + r'sample(\d+)', n).group(1)), n) for n in chunks if n.startswith(prefix + 'sample'))
     if len(samples) < args.frames:
         sys.exit('the log has %d samples, %d expected' % (len(samples), args.frames))

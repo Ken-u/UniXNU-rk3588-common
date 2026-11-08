@@ -9,7 +9,9 @@
 // test (Rk3588Vdec/usertest/vt_test.c, "encoder" part) with boot argument rk3588-venc-ave2=1 and read the "ave2:" lines of the serial log.
 //
 // Boot argument rk3588-venc-ave2=N: 0 off (default), 1 register the service and log, 2 log every call in full (the default stops the hex dumps after the
-// first calls of each selector).
+// first calls of each selector). rk3588-venc-ave2-encode=N: 1 the frames are encoded by RKVENC0 from a recorded trace (the template encoder: the trace's size,
+// quantiser and GOP), 2 H.264 frames are encoded by the encoder core (MPP's encoder: the application's size, bit rate, frame rate and key-frame interval;
+// H.265 stays on the trace).
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOService.h>
@@ -34,6 +36,7 @@ int gLog = 1;
 uint32_t gDeviceType = 9;
 uint32_t gSessions = 0;
 bool gEncode = false;        // rk3588-venc-ave2-encode=1: the frames are encoded by the block (a trace played with the application's pictures), not made up
+bool gCore = false;          // rk3588-venc-ave2-encode=2: H.264 frames come from the encoder core (any size, the application's bit rate and key-frame interval)
 bool gSurfaceOwner = true;   // create the buffers for the client's task (rk3588-venc-ave2-owner=0: for nobody, as the first runs did)
 constexpr unsigned kSelectors = 64;
 
@@ -349,6 +352,14 @@ class AppleAVE2UserClient : public IOUserClient {
   bool encodeFrame(uint8_t *record);   // the block encodes the application's picture (gEncode); false: nothing was written, make one up
   Rk3588VencStream *encoder = nullptr;
   Rk3588VencPicture picture = {};
+  Rk3588VencCoreStream *coreStream = nullptr;   // gCore: the encoder core's stream (H.264), made at the first picture
+  Rk3588VencCoreSource coreSource = {};
+  bool coreTried = false;
+  // What the application asked for, from the plug-in's Prepare / Start descriptor (words +0x1b0, +0x1c4, +0x1dc; 0: not seen)
+  uint32_t askedBitrate = 0, askedKeyInterval = 0, askedFrameRate = 0;
+  uint8_t lastSets[512] = {};   // the parameter sets of the last IDR picture: the header surface gets them with every picture
+  uint32_t lastSetsBytes = 0;
+  void takeSettings(IOMemoryDescriptor *descriptor, uint32_t selector);
   unsigned encoded = 0;
   uint32_t codec = 1;   // 1 = H.264, 2 = H.265: word +0x10 of the Open call's structure is 0 for the H.264 plug-in and 1 for the H.265 one (the same word of the Prepare / Start
                         // descriptor is the client number the Open answer gave: a first reading took it for the codec and only got the test program's two sessions right)
@@ -399,6 +410,8 @@ IOReturn AppleAVE2UserClient::clientClose() {
   ring.release();
   if (encoder) rk3588_venc_stream_close(encoder);
   encoder = nullptr;
+  if (coreStream) rk3588_venc_core_close(coreStream);
+  coreStream = nullptr;
   if (headerSurface) headerSurface->release();
   headerSurface = nullptr;
   for (auto &set : buffers)
@@ -621,41 +634,105 @@ bool AppleAVE2UserClient::encodeFrame(uint8_t *record) {
     pixels.release();
     return false;
   }
-  if (!encoder) {
-    const char *name = nullptr;
-    encoder = rk3588_venc_stream_open(width, height, codec == 2, &picture, &name);
-    if (!encoder) {
-      printf("rk3588-venc: ave2:   encode: no encoder for %ux%u %s (no trace of that size, or the block is not ready)\n", width, height, codec == 2 ? "H.265" : "H.264");
+  const bool useCore = gCore && codec == 1;
+  Rk3588VencResult result;
+  bool ok = false;
+  if (useCore) {
+    // The encoder core (MPP's encoder): made at the first picture, with the size of the pixel buffers and what the plug-in's descriptor says about the rates.
+    if (!coreStream && !coreTried) {
+      coreTried = true;
+      Rk3588VencCoreSettings settings = {};
+      settings.width = width;
+      settings.height = height;
+      settings.bitrate = askedBitrate;
+      settings.fpsNum = askedFrameRate;
+      settings.fpsDen = askedFrameRate ? 1 : 0;
+      settings.gop = askedKeyInterval;
+      coreStream = rk3588_venc_core_open(&settings, &coreSource);
+      if (!coreStream) printf("rk3588-venc: ave2:   encode: no core stream for %ux%u (the block is busy or not ready, or the core could not be set up)\n", width, height);
+    }
+    if (!coreStream) {
       pixels.release();
       return false;
     }
-    printf("rk3588-venc: ave2:   encode: trace %s, source picture %ux%u strides %u/%u\n", name, picture.width, picture.height, picture.yStride, picture.uStride);
-  }
-  if (picture.width != width || picture.height != height) {
-    printf("rk3588-venc: ave2:   encode: the picture is %ux%u, the trace's %ux%u\n", width, height, picture.width, picture.height);
-    pixels.release();
-    return false;
-  }
-  // NV12 -> planar 4:2:0
-  const uint8_t *luma = pixels.kva + pixels.plane[0].offset, *chroma = pixels.kva + pixels.plane[1].offset;
-  if (pixels.plane[0].offset + pixels.plane[0].stride * height > pixels.length || pixels.plane[1].offset + pixels.plane[1].stride * (height / 2) > pixels.length) {
-    printf("rk3588-venc: ave2:   encode: the planes do not fit the surface\n");
-    pixels.release();
-    return false;
-  }
-  for (uint32_t row = 0; row < height; ++row) memcpy(picture.y + static_cast<size_t>(row) * picture.yStride, luma + row * pixels.plane[0].stride, width);
-  for (uint32_t row = 0; row < height / 2; ++row) {
-    const uint8_t *in = chroma + row * pixels.plane[1].stride;
-    uint8_t *u = picture.u + static_cast<size_t>(row) * picture.uStride, *v = picture.v + static_cast<size_t>(row) * picture.uStride;
-    for (uint32_t col = 0; col < width / 2; ++col) {
-      u[col] = in[2 * col];
-      v[col] = in[2 * col + 1];
+    if (pixels.plane[0].offset + pixels.plane[0].stride * height > pixels.length || pixels.plane[1].offset + pixels.plane[1].stride * (height / 2) > pixels.length ||
+        pixels.plane[0].stride < width || pixels.plane[1].stride < width) {
+      printf("rk3588-venc: ave2:   encode: the planes do not fit the surface\n");
+      pixels.release();
+      return false;
     }
+    if (coreSource.yStride < width || coreSource.vStride < height) {
+      printf("rk3588-venc: ave2:   encode: the picture is %ux%u, the core stream's is smaller\n", width, height);
+      pixels.release();
+      return false;
+    }
+    // NV12 -> the core's NV12 source: the same rows, padded out to whole macroblocks by repeating the last column and the last row (the block reads whole macroblocks)
+    const uint8_t *luma = pixels.kva + pixels.plane[0].offset, *chroma = pixels.kva + pixels.plane[1].offset;
+    const uint32_t rowPad = coreSource.yStride - width;
+    for (uint32_t row = 0; row < coreSource.vStride; ++row) {
+      const uint8_t *in = luma + static_cast<size_t>(row < height ? row : height - 1) * pixels.plane[0].stride;
+      uint8_t *out = coreSource.y + static_cast<size_t>(row) * coreSource.yStride;
+      memcpy(out, in, width);
+      if (rowPad) memset(out + width, in[width - 1], rowPad);
+    }
+    for (uint32_t row = 0; row < coreSource.vStride / 2; ++row) {
+      const uint8_t *in = chroma + static_cast<size_t>(row < height / 2 ? row : height / 2 - 1) * pixels.plane[1].stride;
+      uint8_t *out = coreSource.uv + static_cast<size_t>(row) * coreSource.yStride;
+      memcpy(out, in, width);
+      for (uint32_t i = 0; i < rowPad; i += 2) {
+        out[width + i] = in[width - 2];
+        out[width + i + 1] = in[width - 1];
+      }
+    }
+    pixels.release();
+    Rk3588VencCoreResult coreResult = {};
+    ok = rk3588_venc_core_encode(coreStream, encoded, 0, &coreResult) != 0;
+    if (!ok || !coreResult.data || !coreResult.length) return false;
+    result = {};
+    result.stream = coreResult.data;
+    result.length = coreResult.length;
+    result.headers = lastSetsBytes ? lastSets : nullptr;   // (the parameter sets are in the stream in front of every IDR picture, including the first)
+    result.headerLength = lastSetsBytes;
+    result.job = encoded;
+    result.runUs = coreResult.blockUs;
+    result.hwOffset = 0;   // the slice header the CPU wrote is the start of the slice: nothing in front of the block's bytes to leave out
+  } else {
+    if (!encoder) {
+      const char *name = nullptr;
+      encoder = rk3588_venc_stream_open(width, height, codec == 2, &picture, &name);
+      if (!encoder) {
+        printf("rk3588-venc: ave2:   encode: no encoder for %ux%u %s (no trace of that size, or the block is not ready)\n", width, height, codec == 2 ? "H.265" : "H.264");
+        pixels.release();
+        return false;
+      }
+      printf("rk3588-venc: ave2:   encode: trace %s, source picture %ux%u strides %u/%u\n", name, picture.width, picture.height, picture.yStride, picture.uStride);
+    }
+    if (picture.width != width || picture.height != height) {
+      printf("rk3588-venc: ave2:   encode: the picture is %ux%u, the trace's %ux%u\n", width, height, picture.width, picture.height);
+      pixels.release();
+      return false;
+    }
+    // NV12 -> planar 4:2:0
+    const uint8_t *luma = pixels.kva + pixels.plane[0].offset, *chroma = pixels.kva + pixels.plane[1].offset;
+    if (pixels.plane[0].offset + pixels.plane[0].stride * height > pixels.length || pixels.plane[1].offset + pixels.plane[1].stride * (height / 2) > pixels.length) {
+      printf("rk3588-venc: ave2:   encode: the planes do not fit the surface\n");
+      pixels.release();
+      return false;
+    }
+    for (uint32_t row = 0; row < height; ++row) memcpy(picture.y + static_cast<size_t>(row) * picture.yStride, luma + row * pixels.plane[0].stride, width);
+    for (uint32_t row = 0; row < height / 2; ++row) {
+      const uint8_t *in = chroma + row * pixels.plane[1].stride;
+      uint8_t *u = picture.u + static_cast<size_t>(row) * picture.uStride, *v = picture.v + static_cast<size_t>(row) * picture.uStride;
+      for (uint32_t col = 0; col < width / 2; ++col) {
+        u[col] = in[2 * col];
+        v[col] = in[2 * col + 1];
+      }
+    }
+    pixels.release();
+    ok = rk3588_venc_stream_encode(encoder, &result) != 0;
+    if (!ok || !result.stream || !result.length) return false;
   }
-  pixels.release();
-  Rk3588VencResult result;
-  const bool ok = rk3588_venc_stream_encode(encoder, &result);
-  if (!ok || !result.stream || !result.length) return false;
+
   Nal nals[32];
   const bool hevc = codec == 2;
   const unsigned count = splitNals(result.stream, result.length, nals, 32, hevc);
@@ -699,6 +776,8 @@ bool AppleAVE2UserClient::encodeFrame(uint8_t *record) {
   if (ownBytes) {
     sets = own;
     setBytes = ownBytes;
+    memcpy(lastSets, own, ownBytes);   // for the pictures that carry none
+    lastSetsBytes = ownBytes;
   }
   if (!slices || !sets || !setBytes || setBytes > header.length) {
     printf("rk3588-venc: ave2:   encode: job %u gave %u NAL units, %u slices, %u bytes of parameter sets\n", result.job, count, slices, setBytes);
@@ -843,6 +922,22 @@ void AppleAVE2UserClient::notify(uint64_t counter, uint64_t second, const char *
   printf("rk3588-venc: ave2:   -> notification %s: counter %llu, second %llu: %#x\n", what, static_cast<unsigned long long>(counter), static_cast<unsigned long long>(second), kr);
 }
 
+// What the application asked for, in the plug-in's Prepare and Start descriptor (267944 bytes, the same settings in both; found by changing them in the VideoToolbox test:
+// run vt1, AverageBitRate 1 000 000 / 3 000 000 and 2 000 000, MaxKeyFrameInterval 7 / 12 / (unset: 30), ExpectedFrameRate 25 / 15 / (unset: 30)): the average bit
+// rate in bit/s at +0x1b0, the longest run of pictures between key frames at +0x1c4, the frame rate at +0x1dc.
+void AppleAVE2UserClient::takeSettings(IOMemoryDescriptor *descriptor, uint32_t selector) {
+  uint8_t head[0x200] = {};
+  if (!descriptor || descriptor->getLength() < sizeof head || descriptor->prepare(kIODirectionOut) != kIOReturnSuccess) return;
+  const uint64_t n = descriptor->readBytes(0, head, sizeof head);
+  descriptor->complete(kIODirectionOut);
+  if (n < sizeof head) return;
+  const uint32_t bitrate = field<uint32_t>(head, 0x1b0), keyInterval = field<uint32_t>(head, 0x1c4), frameRate = field<uint32_t>(head, 0x1dc);
+  if (bitrate >= 1000 && bitrate <= 200000000) askedBitrate = bitrate;
+  if (keyInterval >= 1 && keyInterval <= 36000) askedKeyInterval = keyInterval;
+  if (frameRate >= 1 && frameRate <= 240) askedFrameRate = frameRate;
+  printf("rk3588-venc: ave2:   settings (selector %u): %u bit/s, a key frame at least every %u pictures, %u frames per second\n", selector, askedBitrate, askedKeyInterval, askedFrameRate);
+}
+
 IOReturn AppleAVE2UserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) {
   if (!args) return kIOReturnBadArgument;
   const unsigned index = selector < kSelectors ? selector : kSelectors - 1;
@@ -879,6 +974,7 @@ IOReturn AppleAVE2UserClient::externalMethod(uint32_t selector, IOExternalMethod
       printf("rk3588-venc: ave2:   output descriptor of %llu bytes\n", static_cast<unsigned long long>(args->structureOutputDescriptor->getLength()));
     }
   }
+  if ((selector == 3 || selector == 4) && args->structureInputDescriptor) takeSettings(args->structureInputDescriptor, selector);
   if (selector == 2 && args->asyncWakePort && args->structureInputSize >= 40) {
     // The plug-in's call carries a zeroed reference; the function to call and its context are in the structure (five 64-bit words: two it keeps for
     // itself, a flags word, the frame receiver's callback at +0x18 and the receiver at +0x20): build the reference the way the original extension does.
@@ -928,7 +1024,10 @@ extern "C" void rk3588_venc_ave2_serve(void) {
   if (gLog <= 0) return;
   if (PE_parse_boot_argn("rk3588-venc-ave2-type", &value, sizeof value)) gDeviceType = value;
   if (PE_parse_boot_argn("rk3588-venc-ave2-owner", &value, sizeof value)) gSurfaceOwner = value != 0;
-  if (PE_parse_boot_argn("rk3588-venc-ave2-encode", &value, sizeof value)) gEncode = value != 0;
+  if (PE_parse_boot_argn("rk3588-venc-ave2-encode", &value, sizeof value)) {
+    gEncode = value != 0;
+    gCore = value >= 2;
+  }
   AppleAVE2Driver *service = OSTypeAlloc(AppleAVE2Driver);
   if (!service || !service->init() || !service->attach(IOService::getResourceService()) || !service->start(IOService::getResourceService())) {
     printf("rk3588-venc: ave2: could not make the service\n");

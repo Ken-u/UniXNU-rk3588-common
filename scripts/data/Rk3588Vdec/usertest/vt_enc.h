@@ -11,6 +11,16 @@
 extern const CFStringRef kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder;
 extern const CFStringRef kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder;
 extern const CFStringRef kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder;
+extern const CFStringRef kVTCompressionPropertyKey_MaxKeyFrameInterval;
+extern const CFStringRef kVTCompressionPropertyKey_ExpectedFrameRate;
+
+/* What a session asks of the encoder besides its size: the average bit rate, the longest run of pictures between key frames (0: not set) and the expected frame
+ * rate (0: not set). The kernel service reads them from the plug-in's Prepare descriptor. */
+struct enc_settings {
+   int bitrate, keyint, fps;
+   const char *tag;   /* prefix of the names of the data rows the session prints (tools/check-vt-enc.py --tag) */
+   unsigned dump;     /* how many of its first samples are printed */
+};
 
 struct enc_state {
    unsigned frames, key, errors;
@@ -19,6 +29,8 @@ struct enc_state {
    int described;
    uint32_t crc;
    int hevc;   /* the session's codec: the data rows of an H.265 session are named h265_... */
+   const char *tag;
+   unsigned dump;
 };
 
 static int enc_wanted(void)
@@ -78,11 +90,11 @@ static void enc_output(void *refcon, void *frameRefcon, OSStatus status, VTEncod
           (unsigned)flags);
    if (st->frames < 2)
       hex_line("sample head", head, length);
-   if (st->frames < 8 && block && length && length <= (1u << 20)) {
+   if (st->frames < st->dump && block && length && length <= (1u << 20)) {
       uint8_t *all = malloc(length);
       if (all && CMBlockBufferCopyDataBytes(block, 0, length, all) == noErr) {
          char name[32];
-         snprintf(name, sizeof name, "%ssample%u%s", st->hevc ? "h265_" : "", st->frames, key ? "k" : "");
+         snprintf(name, sizeof name, "%s%ssample%u%s", st->tag, st->hevc ? "h265_" : "", st->frames, key ? "k" : "");
          hex_dump(name, all, length);
          hex_dump(name, all, length);   /* twice: the kernel's own log lines can cut into a row, the checker takes the union */
       }
@@ -109,7 +121,7 @@ static void enc_output(void *refcon, void *frameRefcon, OSStatus status, VTEncod
             OSStatus got = st->hevc ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format, k, &one, &oneSize, NULL, NULL)
                                     : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, k, &one, &oneSize, NULL, NULL);
             if (got == noErr && one) {
-               snprintf(name, sizeof name, "%sset%zu", st->hevc ? "h265_" : "", k);
+               snprintf(name, sizeof name, "%s%sset%zu", st->tag, st->hevc ? "h265_" : "", k);
                hex_dump(name, one, oneSize);
             }
          }
@@ -139,15 +151,20 @@ static void fill_nv12(CVPixelBufferRef pixels, unsigned frame)
    CVPixelBufferUnlockBaseAddress(pixels, 0);
 }
 
-static int run_encode(CMVideoCodecType codec, unsigned width, unsigned height, unsigned frames, int require)
+static int run_encode(CMVideoCodecType codec, unsigned width, unsigned height, unsigned frames, int require, const struct enc_settings *settings)
 {
+   static const struct enc_settings defaults = {2000000, 0, 0, "", 8};
+   const struct enc_settings *want = settings ? settings : &defaults;
    const char *name = codec == kCMVideoCodecType_HEVC ? "H.265" : "H.264";
-   say("vt-enc: %s %ux%u, %u frames, hardware %s", name, width, height, frames, require ? "required" : "enabled");
+   say("vt-enc: %s %ux%u, %u frames, hardware %s, bit rate %d key frame interval %d frame rate %d", name, width, height, frames, require ? "required" : "enabled", want->bitrate,
+       want->keyint, want->fps);
    CFMutableDictionaryRef spec = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
    CFDictionarySetValue(spec, require ? kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder : kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
                         kCFBooleanTrue);
    struct enc_state st = {};
    st.hevc = codec == kCMVideoCodecType_HEVC;
+   st.tag = want->tag;
+   st.dump = want->dump;
    VTCompressionSessionRef session = NULL;
    uint64_t t0 = now_ms();
    OSStatus status = VTCompressionSessionCreate(kCFAllocatorDefault, (int32_t)width, (int32_t)height, codec, spec, NULL, NULL, enc_output, &st, &session);
@@ -160,10 +177,22 @@ static int run_encode(CMVideoCodecType codec, unsigned width, unsigned height, u
    say("vt-enc: UsingHardwareAcceleratedVideoEncoder: status %d value %s", (int)ps, hw == kCFBooleanTrue ? "true" : hw == kCFBooleanFalse ? "false" : hw ? "?" : "none");
    if (hw)
       CFRelease(hw);
-   int value = 2000000;
+   int value = want->bitrate;
    CFNumberRef number = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &value);
    say("vt-enc: set AverageBitRate: %d", (int)VTSessionSetProperty(session, kVTCompressionPropertyKey_AverageBitRate, number));
    CFRelease(number);
+   if (want->keyint) {
+      value = want->keyint;
+      number = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &value);
+      say("vt-enc: set MaxKeyFrameInterval: %d", (int)VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, number));
+      CFRelease(number);
+   }
+   if (want->fps) {
+      value = want->fps;
+      number = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &value);
+      say("vt-enc: set ExpectedFrameRate: %d", (int)VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, number));
+      CFRelease(number);
+   }
    say("vt-enc: set RealTime: %d", (int)VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue));
    say("vt-enc: set AllowFrameReordering: %d", (int)VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse));
    t0 = now_ms();
@@ -247,7 +276,13 @@ static void encoder_pass(unsigned pass)
    probe_ave2();
    list_encoders();
    unsigned failed = 0;
-   failed += run_encode(kCMVideoCodecType_H264, 640, 360, 5, 1) != 0;
-   failed += run_encode(kCMVideoCodecType_HEVC, 640, 360, 5, 1) != 0;
+   failed += run_encode(kCMVideoCodecType_H264, 640, 360, 5, 1, NULL) != 0;
+   failed += run_encode(kCMVideoCodecType_HEVC, 640, 360, 5, 1, NULL) != 0;
+   /* what the descriptors say when the settings change (which words are the bit rate, the key frame interval and the frame rate), and whether the pictures follow */
+   static const struct enc_settings first = {1000000, 7, 25, "k_", 8}, second = {3000000, 12, 15, "r_", 6}, big = {6000000, 0, 0, "f_", 2}, odd = {1500000, 0, 0, "o_", 3};
+   failed += run_encode(kCMVideoCodecType_H264, 640, 360, 16, 1, &first) != 0;   /* key frames at 0, 7 and 14 */
+   failed += run_encode(kCMVideoCodecType_H264, 640, 360, 6, 1, &second) != 0;
+   failed += run_encode(kCMVideoCodecType_H264, 1920, 1080, 4, 1, &big) != 0;
+   failed += run_encode(kCMVideoCodecType_H264, 480, 270, 3, 1, &odd) != 0;      /* a size with neither a trace nor a multiple of 16 rows */
    say("vt-enc: pass %u done, %u encoder run(s) failed", pass, failed);
 }
