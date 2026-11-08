@@ -402,6 +402,7 @@ int venc_core_encode(VencCore *core, int64_t pts, int forceIdr, VencPacket *out)
     core->stats.jobErrors++;
     goto done;
   }
+  core->stats.jobs++;
 
   // mpp_get_packet(): the result from the output port
   task = NULL;

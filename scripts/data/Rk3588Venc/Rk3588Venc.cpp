@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include "Rk3588Venc.h"
+#include "core/VencCore.h"
 #include "VencTrace.h"
 #include "VencTrace.inc"
 
@@ -577,6 +578,50 @@ extern "C" int rk3588_venc_stream_encode(struct Rk3588VencStream *stream, struct
   return ok;
 }
 
+// ---- the block for the encoder core (core/VencCore.h, Rk3588VencCore.cpp): the jobs MPP's register generator makes, run as the template encoder runs a recording
+
+extern "C" int rk3588_venc_core_run(void *, const uint32_t *regs, const VencRun *runs, unsigned nRuns, uint32_t *status) {
+  __asm__ volatile("dsb sy" ::: "memory");
+  // rkvenc_run: "add force clear to avoid pagefault" (VEPU580), clear the hardware counter, the registers, the start
+  vencWrite(venc::kRegClear, 0x2);
+  IODelay(5);
+  vencWrite(venc::kRegClear, 0);
+  vencWrite(venc::kRegHwCounter, 0x2);
+  for (unsigned r = 0; r < nRuns; ++r)
+    for (unsigned w = 0; w < runs[r].count; ++w) {
+      const unsigned index = runs[r].first + w;
+      if (index != venc::kRegStart) vencWrite(4 * index, regs[index]);
+    }
+  __asm__ volatile("dsb sy" ::: "memory");
+  const uint64_t start = nowUs();
+  vencWrite(venc::kRegStartOff, regs[venc::kRegStart]);
+  uint32_t st = 0;
+  bool done = false;
+  for (;;) {
+    st = vencRead(venc::kRegIntSta);
+    if (st & (venc::kStaEncDone | venc::kStaErrorMask)) {
+      done = (st & venc::kStaEncDone) != 0;
+      break;
+    }
+    if (nowUs() - start > 500000) break;
+    IODelay(20);
+  }
+  *status = st;
+  if (st) vencWrite(venc::kRegIntClr, st);   // rkvenc_irq: clear what was seen
+  __asm__ volatile("dsb sy" ::: "memory");
+  return done && !(st & venc::kStaErrorMask) ? 0 : -1;
+}
+
+extern "C" void rk3588_venc_core_read_regs(void *, uint32_t byteOffset, uint32_t *dst, unsigned words) {
+  for (unsigned i = 0; i < words; ++i) dst[i] = vencRead(byteOffset + 4 * i);
+}
+
+extern "C" void rk3588_venc_core_window(uint8_t **virt, uint64_t *bus, uint32_t *bytes) {
+  *virt = gDma;
+  *bus = rk3588_venc_config.dma_phys;
+  *bytes = rk3588_venc_config.dma_bytes;
+}
+
 namespace {
 
 void vencThread(void *, wait_result_t) {
@@ -600,6 +645,11 @@ void vencThread(void *, wait_result_t) {
          rk3588_venc_config.dma_bytes, static_cast<unsigned>(sizeof kVencTraces / sizeof kVencTraces[0]));
   if (gMode == 5) {   // only the AppleAVE2 service uses the block (rk3588-venc-ave2=2): no self-test
     gReady = true;
+    return;
+  }
+  if (gMode == 6) {   // the encoder core made of MPP's code (no traces): Rk3588VencCore.cpp
+    rk3588_venc_core_selftest();
+    lookBlock();
     return;
   }
   selfTest(gMode == 4 ? bootArg("rk3588-venc-passes", 20) : 1, gMode == 3 || bootArg("rk3588-venc-dump", 0));

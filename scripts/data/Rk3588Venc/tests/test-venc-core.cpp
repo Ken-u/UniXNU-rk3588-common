@@ -346,6 +346,152 @@ bool runRecipe(const Recipe &recipe, const std::string &dir) {
   return compare.mismatches == 0;
 }
 
+
+// ---- pictures nobody recorded: the core has to work for any size, either source format and every rate control mode, honour the settings asked for, and not leave the
+// window or the heap in a state the next encoder trips over. There is nothing to compare with (no recording of MPP on these), so what is checked is what must hold: every
+// job is submitted and the picture comes back, IDR pictures start with the parameter sets and non-IDR ones do not, the key frame interval is kept, a forced IDR is an IDR,
+// the rate control moves the quantiser the right way for a bit rate that is far under and far over what the (fake) block produces, nothing is outside the window.
+struct Smoke {
+  const char *name;
+  uint32_t width, height;
+  int format, rcMode;
+  int qp;
+  uint32_t bitrate, gop;
+  int frames;
+  int forceIdrAt;   // a picture index, or -1
+};
+
+struct Outcome {
+  std::vector<int> idr;   // picture indices that were IDR
+  std::vector<int> qp;    // the picture quantiser the core put in each job (register 192, bits 8..13: the status read-back that would say what the block used is not faked)
+  VencStats stats;
+  bool ok;
+};
+
+void collectQp(void *ctx, const VencJobInfo *info) { static_cast<std::vector<int> *>(ctx)->push_back(static_cast<int>((info->rawRegs[192] >> 8) & 0x3f)); }
+
+Outcome runSmoke(const Smoke &sm, const std::vector<std::pair<int, std::pair<const char *, int>>> &changes = {}) {
+  Outcome out = {};
+  Fake fake;
+  fake.window.assign(kWindow + 4096, 0);
+  fake.base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(fake.window.data()) + 4095) & ~uintptr_t(4095));
+  VencHw hw = {};
+  hw.ctx = &fake;
+  hw.dmaVirt = fake.base;
+  hw.dmaBus = kBus;
+  hw.dmaBytes = kWindow;
+  hw.run = fakeRun;
+  hw.readRegs = fakeReadRegs;
+  VencParams params = {};
+  params.codec = kVencH264;
+  params.width = sm.width;
+  params.height = sm.height;
+  params.format = sm.format;
+  params.rcMode = sm.rcMode;
+  params.qp = sm.qp;
+  params.bitrate = sm.bitrate;
+  params.fpsNum = 30;
+  params.fpsDen = 1;
+  params.gop = sm.gop;
+  params.motionInfo = 1;
+  VencCore *core = nullptr;
+  const int rc = venc_core_create(&core, &hw, &params);
+  CHECK(rc == 0);
+  if (rc) {
+    printf("%s: venc_core_create failed (%d)\n", sm.name, rc);
+    return out;
+  }
+  VencJobObserver observer = {&out.qp, collectQp, nullptr};
+  venc_core_set_observer(core, &observer);
+  uint8_t header[512];
+  const int headerLength = venc_core_header(core, header, sizeof header);
+  CHECK(headerLength > 8);
+  uint32_t sourceBytes = 0;
+  uint8_t *source = venc_core_source(core, &sourceBytes);
+  CHECK(source != nullptr);
+  const uint32_t hstride = sm.format == kVencI420 ? (sm.width + 15) & ~15u : (sm.width + 7) & ~7u;
+  const uint32_t vstride = (sm.height + 1) & ~1u;
+  CHECK(sourceBytes >= hstride * vstride * 3 / 2);
+  out.ok = true;
+  for (int f = 0; f < sm.frames && source; ++f) {
+    for (auto &c : changes)
+      if (c.first == f) CHECK(venc_core_set_s32(core, c.second.first, c.second.second) == 0);
+    memset(source, 128, hstride * vstride * 3 / 2);
+    for (uint32_t y = 0; y < sm.height; ++y)
+      for (uint32_t x = 0; x < sm.width; ++x) source[y * hstride + x] = static_cast<uint8_t>(x + 2 * y + 7 * f);
+    VencPacket packet;
+    const int er = venc_core_encode(core, f, f == sm.forceIdrAt, &packet);
+    CHECK(er == 0);
+    if (er) {
+      out.ok = false;
+      break;
+    }
+    CHECK(packet.data != nullptr);
+    CHECK(packet.length == packet.hwOffset + fake.lastLength);
+    CHECK(packet.data >= fake.base && packet.data + packet.length <= fake.base + kWindow);
+    const bool startsWithSps = packet.hwOffset > 0 && packet.data[0] == 0 && packet.data[1] == 0 && packet.data[2] == 0 && packet.data[3] == 1 && (packet.data[4] & 0x1f) == 7;
+    if (packet.isIdr && f > 0) CHECK(startsWithSps);
+    if (!packet.isIdr) CHECK(packet.hwOffset == 0 || !startsWithSps);
+    if (packet.isIdr) out.idr.push_back(f);
+  }
+  venc_core_stats(core, &out.stats);
+  CHECK(out.stats.jobErrors == 0);
+  CHECK(out.stats.windowPeakBytes <= kWindow);
+  venc_core_destroy(core);
+  return out;
+}
+
+bool runSmokes() {
+  const int before = gFailures;
+  const Smoke smokes[] = {
+      {"s176_i420_qp", 176, 144, kVencI420, kVencRcFixQp, 26, 0, 0, 4, -1},
+      {"s322x242_nv12_qp", 322, 242, kVencNv12, kVencRcFixQp, 30, 0, 0, 4, -1},
+      {"s640x480_i420_cbr", 640, 480, kVencI420, kVencRcCbr, 0, 800000, 5, 12, -1},
+      {"s640x360_nv12_vbr", 640, 360, kVencNv12, kVencRcVbr, 0, 1000000, 0, 6, -1},
+      {"s1366x768_nv12_cbr", 1366, 768, kVencNv12, kVencRcCbr, 0, 3000000, 4, 9, 6},
+      {"s1920x1080_i420_qp", 1920, 1080, kVencI420, kVencRcFixQp, 28, 0, 0, 3, -1},
+      {"s1920x1080_nv12_cbr", 1920, 1080, kVencNv12, kVencRcCbr, 0, 6000000, 30, 3, -1},
+  };
+  for (const Smoke &sm : smokes) {
+    const Outcome o = runSmoke(sm);
+    std::vector<int> expected = {0};   // the interval counts from the last IDR picture, a forced one included
+    for (int f = 1, last = 0; f < sm.frames; ++f)
+      if ((sm.gop && f - last == static_cast<int>(sm.gop)) || f == sm.forceIdrAt) expected.push_back(last = f);
+    CHECK(o.idr == expected);
+    printf("%-22s %d pictures, IDR at", sm.name, sm.frames);
+    for (int f : o.idr) printf(" %d", f);
+    printf(", qp");
+    for (int q : o.qp) printf(" %d", q);
+    printf(", window peak %u KiB\n", o.stats.windowPeakBytes >> 10);
+  }
+  // the rate control moves the quantiser the right way: the fake block writes 4000 bytes per picture (960 kbit/s at 30 fps)
+  {
+    const Smoke low = {"rate_low", 640, 360, kVencI420, kVencRcCbr, 0, 100000, 0, 12, -1};
+    const Smoke high = {"rate_high", 640, 360, kVencI420, kVencRcCbr, 0, 8000000, 0, 12, -1};
+    const Outcome a = runSmoke(low), b = runSmoke(high);
+    CHECK(a.qp.size() == 12 && b.qp.size() == 12);
+    if (a.qp.size() == 12 && b.qp.size() == 12) {
+      printf("%-22s qp %d -> %d at 100 kbit/s, %d -> %d at 8 Mbit/s\n", "rate control", a.qp[2], a.qp[11], b.qp[2], b.qp[11]);
+      CHECK(a.qp[11] > b.qp[11]);   // far too many bits for 100 kbit/s: a coarser quantiser than for 8 Mbit/s
+      CHECK(a.qp[11] >= a.qp[2]);   // (45 is where the quantiser of a 100 kbit/s stream already is on the first inter picture)
+      CHECK(b.qp[11] < b.qp[2]);
+    }
+  }
+  // settings changed between pictures are taken up: a new key frame interval, a new bit rate
+  {
+    const Smoke sm = {"changes", 640, 360, kVencI420, kVencRcCbr, 0, 2000000, 0, 14, -1};
+    const std::vector<std::pair<int, std::pair<const char *, int>>> changes = {{5, {"rc:gop", 4}}, {8, {"rc:bps_target", 200000}}, {8, {"rc:bps_max", 250000}}, {8, {"rc:bps_min", 150000}}};
+    const Outcome o = runSmoke(sm, changes);
+    printf("%-22s IDR at", "changed settings");
+    for (int f : o.idr) printf(" %d", f);
+    printf(", qp");
+    for (int q : o.qp) printf(" %d", q);
+    printf("\n");
+    CHECK(o.idr.size() >= 3);   // 0, and every 4th from the change on (the interval counts from the last IDR)
+  }
+  return gFailures == before;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -358,6 +504,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; ++i) wanted = wanted || strcmp(argv[i], recipe.name) == 0;
     if (wanted) ok = runRecipe(recipe, dir) && ok;
   }
+  if (argc < 2 && !getenv("VENC_NO_SMOKE")) ok = runSmokes() && ok;
   printf("%d checks, %d failures\n", gChecks, gFailures);
   return gFailures == 0 && ok ? 0 : 1;
 }

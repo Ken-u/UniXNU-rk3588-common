@@ -91,6 +91,10 @@ typedef struct VencPacket {
 
 typedef struct VencCore VencCore;
 
+// The modules of MPP's objects set themselves up from constructors in the host build. The kernel build (scripts/build-rk3588-venc.py) turns those into plain
+// functions and generates this one, which calls them: the embedder calls it once, before the first venc_core_create. Not defined in the host build.
+void venc_core_register_singletons(void);
+
 // Opens an encoder on `hw`. One block, one window: only one core may be open at a time. Returns 0 on success.
 int venc_core_create(VencCore **out, const VencHw *hw, const VencParams *params);
 void venc_core_destroy(VencCore *core);

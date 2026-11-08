@@ -18,7 +18,10 @@
 // nothing is written); 2 also power the domain on, set the clocks, release the resets, read the block's identification and status registers and do the
 // vendor driver's safe reset once; 3 also map the DMA window and replay the encode-job traces built in (VencTrace.h) once, printing for every job the status, the
 // time the block took, and the bit stream it wrote (tools/check-enc-output.py decodes that on the host); 4 replays them rk3588-venc-passes=N times (default 20),
-// comparing every pass's bit stream with the first's (add rk3588-venc-dump=1 to print the stream of the first pass too).
+// comparing every pass's bit stream with the first's (add rk3588-venc-dump=1 to print the stream of the first pass too); 5 only powers, clocks and maps the block
+// for the AppleAVE2 service (rk3588-venc-ave2-encode=1 does that without this argument); 6 runs the self-test of the encoder core (core/, Rk3588VencCore.cpp: MPP's
+// own H.264 encoder over pictures made here, sizes and rates that were never recorded), printing a line per picture and, with rk3588-venc-core-dump=1, its bytes
+// for tools/check-core-output.py; rk3588-venc-core-log=N lets MPP's own messages through up to level N (default 3).
 #pragma once
 #include <stdint.h>
 
@@ -64,6 +67,15 @@ struct Rk3588VencStream *rk3588_venc_stream_open(uint32_t width, uint32_t height
 void rk3588_venc_stream_close(struct Rk3588VencStream *stream);
 // Encodes the picture now in the DMA window as the next job of the trace; 1 when the block finished it without an error status.
 int rk3588_venc_stream_encode(struct Rk3588VencStream *stream, struct Rk3588VencResult *result);
+
+// ---- the block for the encoder core (core/VencCore.h): what VencHw's callbacks are on the real hardware. rk3588_venc_core_window gives the DMA window mapped by the
+// self-test or the service (null until the block is ready).
+struct VencRun;
+int rk3588_venc_core_run(void *ctx, const uint32_t *regs, const struct VencRun *runs, unsigned nRuns, uint32_t *status);
+void rk3588_venc_core_read_regs(void *ctx, uint32_t byteOffset, uint32_t *dst, unsigned words);
+void rk3588_venc_core_window(uint8_t **virt, uint64_t *bus, uint32_t *bytes);
+// The self-test of the encoder core (boot argument rk3588-venc=6), run by the driver thread once the block is up.
+void rk3588_venc_core_selftest(void);
 
 // Registers the AppleAVE2Driver service (the logging stage, Rk3588VencAve2.cpp) when the boot argument rk3588-venc-ave2=N is set; called by rk3588_venc_start().
 void rk3588_venc_ave2_serve(void);
