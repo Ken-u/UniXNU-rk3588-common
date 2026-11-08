@@ -20,6 +20,7 @@ struct enc_settings {
    int bitrate, keyint, fps;
    const char *tag;   /* prefix of the names of the data rows the session prints (tools/check-vt-enc.py --tag) */
    unsigned dump;     /* how many of its first samples are printed */
+   unsigned reuse;    /* not 0: that many pictures are made before the first call and used in turn (a speed session: the time of making a picture is not the encoder's) */
 };
 
 struct enc_state {
@@ -31,6 +32,8 @@ struct enc_state {
    int hevc;   /* the session's codec: the data rows of an H.265 session are named h265_... */
    const char *tag;
    unsigned dump;
+   uint64_t stamp[128];   /* when each of the first 128 samples arrived (microseconds) */
+   unsigned stamps;
 };
 
 static int enc_wanted(void)
@@ -69,6 +72,8 @@ static void enc_output(void *refcon, void *frameRefcon, OSStatus status, VTEncod
 {
    struct enc_state *st = refcon;
    (void)frameRefcon;
+   if (status == noErr && sample && st->stamps < 128)
+      st->stamp[st->stamps++] = now_us();   /* first: the lines below cost serial time */
    if (status != noErr || !sample) {
       st->errors++;
       say("vt-enc: output callback: status %d flags %#x sample %p", (int)status, (unsigned)flags, (void *)sample);
@@ -151,9 +156,26 @@ static void fill_nv12(CVPixelBufferRef pixels, unsigned frame)
    CVPixelBufferUnlockBaseAddress(pixels, 0);
 }
 
+static CVPixelBufferRef new_nv12(unsigned width, unsigned height, unsigned frame)
+{
+   CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+   CFDictionaryRef surface = CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+   CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, surface);
+   CFRelease(surface);
+   CVPixelBufferRef pixels = NULL;
+   CVReturn cv = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attrs, &pixels);
+   CFRelease(attrs);
+   if (cv != kCVReturnSuccess || !pixels) {
+      say("vt-enc: CVPixelBufferCreate: %d", (int)cv);
+      return NULL;
+   }
+   fill_nv12(pixels, frame);
+   return pixels;
+}
+
 static int run_encode(CMVideoCodecType codec, unsigned width, unsigned height, unsigned frames, int require, const struct enc_settings *settings)
 {
-   static const struct enc_settings defaults = {2000000, 0, 0, "", 8};
+   static const struct enc_settings defaults = {2000000, 0, 0, "", 8, 0};
    const struct enc_settings *want = settings ? settings : &defaults;
    const char *name = codec == kCMVideoCodecType_HEVC ? "H.265" : "H.264";
    say("vt-enc: %s %ux%u, %u frames, hardware %s, bit rate %d key frame interval %d frame rate %d", name, width, height, frames, require ? "required" : "enabled", want->bitrate,
@@ -199,23 +221,27 @@ static int run_encode(CMVideoCodecType codec, unsigned width, unsigned height, u
    status = VTCompressionSessionPrepareToEncodeFrames(session);
    say("vt-enc: PrepareToEncodeFrames: %d (%llu ms)", (int)status, (unsigned long long)(now_ms() - t0));
    int failed = status != noErr;
+   CVPixelBufferRef pool[16] = {};
+   const unsigned reuse = want->reuse < 16 ? want->reuse : 16;
+   for (unsigned i = 0; i < reuse && !failed; ++i) {
+      pool[i] = new_nv12(width, height, i);
+      failed = !pool[i];
+   }
+   uint64_t encodeUs = 0;
+   const uint64_t startUs = now_us();
    for (unsigned frame = 0; frame < frames && !failed; ++frame) {
-      CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-      CFDictionaryRef surface = CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-      CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, surface);
-      CFRelease(surface);
-      CVPixelBufferRef pixels = NULL;
-      CVReturn cv = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attrs, &pixels);
-      CFRelease(attrs);
-      if (cv != kCVReturnSuccess || !pixels) {
-         say("vt-enc: CVPixelBufferCreate: %d", (int)cv);
+      CVPixelBufferRef pixels = reuse ? pool[frame % reuse] : new_nv12(width, height, frame);
+      if (!pixels) {
          failed = 1;
          break;
       }
-      fill_nv12(pixels, frame);
+      if (reuse)
+         CFRetain(pixels);
       VTEncodeInfoFlags flags = 0;
       t0 = now_ms();
+      const uint64_t callUs = now_us();
       status = VTCompressionSessionEncodeFrame(session, pixels, CMTimeMake(frame, 30), CMTimeMake(1, 30), NULL, NULL, &flags);
+      encodeUs += now_us() - callUs;
       if (frame < 2 || status != noErr)
          say("vt-enc: EncodeFrame %u: %d flags %#x (%llu ms)", frame, (int)status, (unsigned)flags, (unsigned long long)(now_ms() - t0));
       CFRelease(pixels);
@@ -224,6 +250,23 @@ static int run_encode(CMVideoCodecType codec, unsigned width, unsigned height, u
    t0 = now_ms();
    status = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
    say("vt-enc: CompleteFrames: %d (%llu ms)", (int)status, (unsigned long long)(now_ms() - t0));
+   for (unsigned i = 0; i < reuse; ++i)
+      if (pool[i])
+         CFRelease(pool[i]);
+   if (st.stamps >= 6 && frames) {
+      /* the pictures a second the encoder keeps up with: the spacing of the samples from the fourth on (the first ones pay for the session and the lines above) */
+      const unsigned last = st.stamps - 1;
+      const uint64_t span = st.stamp[last] - st.stamp[3];
+      uint64_t worst = 0;
+      for (unsigned i = 4; i <= last; ++i)
+         if (st.stamp[i] - st.stamp[i - 1] > worst)
+            worst = st.stamp[i] - st.stamp[i - 1];
+      const unsigned long long each = span / (last - 3), tenths = span ? 10000000ull * (last - 3) / span : 0;
+      say("vt-enc: timing %s %ux%u: %u frames, the first sample %llu ms after the first call, then %llu us a sample (worst gap %llu us) = %llu.%llu pictures a second, EncodeFrame calls %llu us "
+          "each, all %u samples after %llu ms",
+          name, width, height, frames, (unsigned long long)((st.stamp[0] - startUs) / 1000), each, (unsigned long long)worst, tenths / 10, tenths % 10,
+          (unsigned long long)(encodeUs / frames), st.stamps, (unsigned long long)((st.stamp[last] - startUs) / 1000));
+   }
    VTCompressionSessionInvalidate(session);
    CFRelease(session);
    say("vt-enc: %s done: %u of %u samples, %u sync, %zu bytes, %u errors", name, st.frames, frames, st.key, st.bytes, st.errors);
@@ -279,7 +322,7 @@ static void encoder_pass(unsigned pass)
    failed += run_encode(kCMVideoCodecType_H264, 640, 360, 5, 1, NULL) != 0;
    failed += run_encode(kCMVideoCodecType_HEVC, 640, 360, 5, 1, NULL) != 0;
    /* what the descriptors say when the settings change (which words are the bit rate, the key frame interval and the frame rate), and whether the pictures follow */
-   static const struct enc_settings first = {1000000, 7, 25, "k_", 8}, second = {3000000, 12, 15, "r_", 6}, big = {6000000, 0, 0, "f_", 2}, odd = {1500000, 0, 0, "o_", 3};
+   static const struct enc_settings first = {1000000, 7, 25, "k_", 16}, second = {3000000, 12, 15, "r_", 6}, big = {6000000, 0, 0, "f_", 2}, odd = {1500000, 0, 0, "o_", 3};
    failed += run_encode(kCMVideoCodecType_H264, 640, 360, 16, 1, &first) != 0;   /* key frames at 0, 7 and 14 */
    failed += run_encode(kCMVideoCodecType_H264, 640, 360, 6, 1, &second) != 0;
    failed += run_encode(kCMVideoCodecType_H264, 1920, 1080, 4, 1, &big) != 0;
@@ -289,5 +332,11 @@ static void encoder_pass(unsigned pass)
    failed += run_encode(kCMVideoCodecType_HEVC, 640, 360, 6, 1, &second) != 0;
    failed += run_encode(kCMVideoCodecType_HEVC, 1920, 1080, 4, 1, &big) != 0;
    failed += run_encode(kCMVideoCodecType_HEVC, 480, 270, 3, 1, &odd) != 0;
+   /* how fast the encoder goes when nothing holds it back: pictures made beforehand, used in turn; the "timing" line of each session is the result */
+   static const struct enc_settings speed = {4000000, 0, 30, "s_", 0, 4};
+   failed += run_encode(kCMVideoCodecType_H264, 640, 360, 60, 1, &speed) != 0;
+   failed += run_encode(kCMVideoCodecType_HEVC, 640, 360, 60, 1, &speed) != 0;
+   failed += run_encode(kCMVideoCodecType_H264, 1920, 1080, 30, 1, &speed) != 0;
+   failed += run_encode(kCMVideoCodecType_HEVC, 1920, 1080, 30, 1, &speed) != 0;
    say("vt-enc: pass %u done, %u encoder run(s) failed", pass, failed);
 }
