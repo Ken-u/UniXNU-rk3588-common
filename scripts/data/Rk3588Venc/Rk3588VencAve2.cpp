@@ -33,6 +33,7 @@ int gLog = 1;
 // the kernel extension carry; entries 8 and 9 are the same family and the same function tables, 9 is the A10X's). Boot argument rk3588-venc-ave2-type.
 uint32_t gDeviceType = 9;
 uint32_t gSessions = 0;
+bool gSurfaceOwner = true;   // create the buffers for the client's task (rk3588-venc-ave2-owner=0: for nobody, as the first runs did)
 constexpr unsigned kSelectors = 64;
 
 void hexLines(const char *what, const void *data, size_t length) {
@@ -183,7 +184,7 @@ void setNumber(OSDictionary *dictionary, const char *key, uint64_t value) {
 }
 
 // A data buffer of `size` bytes as an IOSurface the user processes can look up by id (global). Returns the surface (retained, 0 on failure) and its id.
-OSObject *createDataSurface(uint64_t size, uint32_t *id) {
+OSObject *createDataSurface(task_t task, uint64_t size, uint32_t *id) {
   *id = 0;
   IOService *root = surfaceRoot();
   typedef OSObject *(*CreateSurface)(IOService *, task_t, OSDictionary *);
@@ -203,10 +204,85 @@ OSObject *createDataSurface(uint64_t size, uint32_t *id) {
   setNumber(properties, "IOSurfaceAllocSize", size);
   setNumber(properties, "IOSurfacePixelFormat", 0);
   properties->setObject("IOSurfaceIsGlobal", kOSBooleanTrue);
-  OSObject *surface = create(root, nullptr, properties);
+  OSObject *surface = create(root, task, properties);
   properties->release();
   if (surface) *id = field<uint32_t>(surface, kSurfId);
   return surface;
+}
+
+// ---- H.264 parameter sets (made up for now: the plug-in parses them to learn the stream's shape).
+struct BitWriter {
+  uint8_t *bytes;
+  size_t bits = 0;
+  explicit BitWriter(uint8_t *to) : bytes(to) {}
+  void put(uint32_t value, unsigned count) {
+    for (unsigned i = count; i-- > 0;) {
+      if (!(bits & 7)) bytes[bits >> 3] = 0;
+      if ((value >> i) & 1) bytes[bits >> 3] |= static_cast<uint8_t>(0x80 >> (bits & 7));
+      ++bits;
+    }
+  }
+  void ue(uint32_t value) {
+    const uint32_t v = value + 1;
+    unsigned length = 0;
+    while ((v >> length) > 1) ++length;
+    put(0, length);
+    put(v, length + 1);
+  }
+  void se(int32_t value) { ue(value > 0 ? static_cast<uint32_t>(2 * value - 1) : static_cast<uint32_t>(-2 * value)); }
+  void trailing() {
+    put(1, 1);
+    while (bits & 7) put(0, 1);
+  }
+  size_t length() const { return bits >> 3; }
+};
+
+// Annex B SPS + PPS for a progressive frame of the given coded size (Main profile, CAVLC, one reference frame, no B frames); returns the length.
+size_t makeParameterSets(uint8_t *out, uint32_t width, uint32_t height) {
+  size_t n = 0;
+  static const uint8_t startCode[4] = {0, 0, 0, 1};
+  memcpy(out + n, startCode, 4);
+  n += 4;
+  out[n++] = 0x67;
+  BitWriter sps(out + n);
+  sps.put(77, 8);      // profile_idc: Main
+  sps.put(0, 8);       // constraint flags
+  sps.put(31, 8);      // level_idc 3.1
+  sps.ue(0);           // seq_parameter_set_id
+  sps.ue(0);           // log2_max_frame_num_minus4
+  sps.ue(2);           // pic_order_cnt_type: 2 (output order is decoding order)
+  sps.ue(1);           // max_num_ref_frames
+  sps.put(0, 1);       // gaps_in_frame_num_value_allowed_flag
+  sps.ue(width / 16 - 1);
+  sps.ue(height / 16 - 1);
+  sps.put(1, 1);       // frame_mbs_only_flag
+  sps.put(1, 1);       // direct_8x8_inference_flag
+  sps.put(0, 1);       // frame_cropping_flag
+  sps.put(0, 1);       // vui_parameters_present_flag
+  sps.trailing();
+  n += sps.length();
+  memcpy(out + n, startCode, 4);
+  n += 4;
+  out[n++] = 0x68;
+  BitWriter pps(out + n);
+  pps.ue(0);           // pic_parameter_set_id
+  pps.ue(0);           // seq_parameter_set_id
+  pps.put(0, 1);       // entropy_coding_mode_flag: CAVLC
+  pps.put(0, 1);       // bottom_field_pic_order_in_frame_present_flag
+  pps.ue(0);           // num_slice_groups_minus1
+  pps.ue(0);           // num_ref_idx_l0_default_active_minus1
+  pps.ue(0);           // num_ref_idx_l1_default_active_minus1
+  pps.put(0, 1);       // weighted_pred_flag
+  pps.put(0, 2);       // weighted_bipred_idc
+  pps.se(0);           // pic_init_qp_minus26
+  pps.se(0);           // pic_init_qs_minus26
+  pps.se(0);           // chroma_qp_index_offset
+  pps.put(1, 1);       // deblocking_filter_control_present_flag
+  pps.put(0, 1);       // constrained_intra_pred_flag
+  pps.put(0, 1);       // redundant_pic_cnt_present_flag
+  pps.trailing();
+  n += pps.length();
+  return n;
 }
 
 }  // namespace
@@ -234,7 +310,14 @@ class AppleAVE2UserClient : public IOUserClient {
   OSObject *buffers[3][kBuffers] = {};   // the data surfaces created for Start (kept until the connection closes)
   uint32_t bufferIds[3][kBuffers] = {};
   bool buffersMade = false;
+  OSObject *headerSurface = nullptr;   // where the plug-in finds the stream headers (SPS, PPS) of the first frame: its id is in word +0x170 of the Start answer
+  uint32_t headerId = 0;
   unsigned yuvDumps = 0;
+  unsigned receiverDumps = 0;
+  uint32_t yuvNotified[32] = {};   // number + 1 of the YUV request answered in each ring position
+  void fakeFrame(uint8_t *record);
+  void dumpReceiver();
+  bool receiverDumped = false;
   unsigned walkRecords(const char *when, bool dump, uint64_t *numbers, uint32_t *kinds, unsigned room);
   void completePending(const char *when, bool dump);
   void answerStart(uint8_t *record);
@@ -278,6 +361,8 @@ IOReturn AppleAVE2UserClient::clientClose() {
   if (haveCallback) releaseAsyncReference64(asyncReference);
   haveCallback = false;
   ring.release();
+  if (headerSurface) headerSurface->release();
+  headerSurface = nullptr;
   for (auto &set : buffers)
     for (auto &surface : set) {
       if (surface) surface->release();
@@ -317,7 +402,8 @@ unsigned AppleAVE2UserClient::walkRecords(const char *when, bool dump, uint64_t 
       uint8_t *record = ring.kva + static_cast<size_t>(i) * kRecord;
       if (!record[0]) continue;
       const uint32_t number = field<uint32_t>(record, 4), kind = field<uint32_t>(record, 0xc0);
-      printf("rk3588-venc: ave2:   ring (%s): record %u: in use, number %u, kind %#x\n", when, i, number, kind);
+      printf("rk3588-venc: ave2:   ring (%s): record %u: in use, number %u, kind %#x, frame state %u, slot %u, status %#x, stamp %#llx\n", when, i, number, kind, field<uint32_t>(record, 0x5b34),
+             field<uint32_t>(record, 0x46c), field<uint32_t>(record, 0x2e4), static_cast<unsigned long long>(field<uint64_t>(record, 0x6b90)));
       if (dump) nonZeroRows("record", record, kRecord, 60);
       if (used < room) {
         numbers[used] = number;
@@ -372,16 +458,103 @@ void AppleAVE2UserClient::answerStart(uint8_t *record) {
   if (!buffersMade) {
     for (unsigned set = 0; set < 3; ++set)
       for (unsigned i = 0; i < kBuffers; ++i) {
-        buffers[set][i] = createDataSurface(sizes[set], &bufferIds[set][i]);
+        buffers[set][i] = createDataSurface(gSurfaceOwner ? ownerTask : nullptr, sizes[set], &bufferIds[set][i]);
         printf("rk3588-venc: ave2:   buffer %u.%u: %llu bytes, surface id %u%s\n", set, i, static_cast<unsigned long long>(sizes[set]), bufferIds[set][i], buffers[set][i] ? "" : " (failed)");
       }
     buffersMade = true;
   }
-  const uint32_t count = kBuffers;
-  memcpy(record + 0x170, &count, sizeof count);
+  if (!headerSurface) {
+    headerSurface = createDataSurface(gSurfaceOwner ? ownerTask : nullptr, 0x1000, &headerId);
+    printf("rk3588-venc: ave2:   header surface: surface id %u%s\n", headerId, headerSurface ? "" : " (failed)");
+  }
+  // Word +0x170 is not a count (the first reading of the plug-in took it for one): the plug-in's code that sends the stream headers looks the surface of that id up.
+  memcpy(record + 0x170, &headerId, sizeof headerId);
   static const size_t offsets[3] = {0x174, 0x1ec, 0x264};
   for (unsigned set = 0; set < 3; ++set)
     for (unsigned i = 0; i < kBuffers; ++i) memcpy(record + offsets[set] + 4 * i, &bufferIds[set][i], sizeof(uint32_t));
+}
+
+// What the hardware would have left for a finished frame, made up: one slice. The plug-in's frame-done code takes from the slot's parameter block (set 1) the
+// number of slices (+0xf0), a 12-byte filler entry per frame (+0xf4) and an array of 0x220-byte slice records from +0x180 (word 0 = the slice's size including its
+// header, byte +0x20c = the header's size; the first record with size 0 ends the list), and the bytes themselves from the slot's output buffer (set 0). Here
+// the header is a start code and the slice a few made-up bytes: enough for the plug-in to get as far as handing a sample to VideoToolbox, not a decodable picture.
+void AppleAVE2UserClient::fakeFrame(uint8_t *record) {
+  const uint32_t slot = field<uint32_t>(record, 0x46c);
+  if (slot >= kBuffers || !bufferIds[0][slot] || !bufferIds[1][slot]) {
+    printf("rk3588-venc: ave2:   fake frame: no buffers for slot %u\n", slot);
+    return;
+  }
+  static const uint8_t slice[] = {0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0x33, 0xff, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc};
+  constexpr uint32_t kHeader = 4;
+  const uint32_t size = sizeof slice;
+  SurfaceMap out, block;
+  if (!out.open(bufferIds[0][slot]) || !block.open(bufferIds[1][slot])) {
+    printf("rk3588-venc: ave2:   fake frame: cannot map the buffers of slot %u\n", slot);
+    out.release();
+    block.release();
+    return;
+  }
+  memcpy(out.kva, slice, sizeof slice);
+  // The stream headers the plug-in's header sender reads from the header surface: length in bits at +0x98 of the parameter block; the coded size of the
+  // picture is in the request (+0xbf8 / +0xbfc: width and height).
+  uint32_t headerBits = 0;
+  if (headerSurface) {
+    SurfaceMap header;
+    if (header.open(headerId)) {
+      uint32_t width = field<uint32_t>(record, 0xbf8), height = field<uint32_t>(record, 0xbfc);
+      if (!width || !height || (width & 15) || (height & 15)) {
+        width = 640;
+        height = 368;
+      }
+      const size_t bytes = makeParameterSets(header.kva, width, height);
+      headerBits = static_cast<uint32_t>(bytes * 8);
+      printf("rk3588-venc: ave2:   headers for %ux%u: %zu bytes\n", width, height, bytes);
+      hexLines("headers", header.kva, bytes);
+      header.release();
+    }
+  }
+  memcpy(block.kva + 0x98, &headerBits, sizeof headerBits);
+  // With the plug-in's settings word 0 clear (as it is here) the same count is read from the request record itself, at +0x5528 (host emulation of the handler:
+  // `tmp/media/ave_emu.py`; the bits the sender found in the block's +0x98 when that word is set).
+  memcpy(record + 0x5528, &headerBits, sizeof headerBits);
+  const uint32_t slices = 1;
+  // The 12-byte entry per frame is not a slice's place: its eight bytes are the prefix of a filler-data NAL unit (last byte = their count) and the word after
+  // them the number of 0xff filler bytes to add after the slice. Zero = no filler (a size here made the plug-in copy a negative number of bytes).
+  const uint64_t fillerPrefix = 0;
+  const uint32_t fillerBytes = 0;
+  memcpy(block.kva + 0xf0, &slices, sizeof slices);
+  memcpy(block.kva + 0xf4, &fillerPrefix, sizeof fillerPrefix);
+  memcpy(block.kva + 0xfc, &fillerBytes, sizeof fillerBytes);
+  memcpy(block.kva + 0x180, &size, sizeof size);
+  block.kva[0x38c] = kHeader;
+  printf("rk3588-venc: ave2:   fake frame for slot %u: one slice of %u bytes\n", slot, size);
+  out.release();
+  block.release();
+}
+
+// The whole frame receiver of the plug-in (the object its notification handler works on), read in pieces and printed as the rows that are not zero: this is what
+// the handler's code can be run against on the host. A piece that cannot be read ends the dump.
+void AppleAVE2UserClient::dumpReceiver() {
+  if (!context) return;
+  constexpr size_t kPiece = 0x1000, kMax = 0x60000;
+  uint8_t *piece = static_cast<uint8_t *>(IOMallocZero(kPiece));
+  if (!piece) return;
+  printf("rk3588-venc: ave2:   receiver dump at %#llx\n", static_cast<unsigned long long>(context));
+  size_t read = 0;
+  for (size_t offset = 0; offset < kMax; offset += kPiece) {
+    if (!peekUser(ownerTask, context + offset, piece, kPiece)) break;
+    read = offset + kPiece;
+    for (size_t row = 0; row < kPiece; row += 16) {
+      bool any = false;
+      for (size_t i = 0; i < 16; ++i) any |= piece[row + i] != 0;
+      if (!any) continue;
+      char line[3 * 16 + 1] = {};
+      for (size_t i = 0; i < 16; ++i) snprintf(line + 3 * i, 4, "%02x ", piece[row + i]);
+      printf("rk3588-venc: ave2:   rcv %06lx: %s\n", static_cast<unsigned long>(offset + row), line);
+    }
+  }
+  printf("rk3588-venc: ave2:   receiver dump: %zu bytes read\n", read);
+  IOFree(piece, kPiece);
 }
 
 // Answer every request the plug-in has outstanding, in the order of its ring: the plug-in's own bookkeeping says what each one was.
@@ -409,11 +582,45 @@ void AppleAVE2UserClient::completePending(const char *when, bool dump) {
         }
       }
     }
+    if (kinds[i] == 0x4569 && ring.valid()) {
+      // A YUV request is answered once: the "frame" it asked for is made up (fakeFrame) before the notification.
+      const unsigned position = static_cast<unsigned>(numbers[i] % 32);
+      if (yuvNotified[position] == numbers[i] + 1) continue;
+      yuvNotified[position] = static_cast<uint32_t>(numbers[i] + 1);
+      fakeFrame(ring.kva + static_cast<size_t>(position) * 0x10630);
+      if (!receiverDumped) {
+        receiverDumped = true;
+        dumpReceiver();
+        uint8_t *record = ring.kva + static_cast<size_t>(position) * 0x10630;
+        nonZeroRows("yuv record", record, 0x10630, 600);
+      }
+    }
     notify(numbers[i], 0, "request done");
   }
   if (n) {
     IOSleep(300);
     walkRecords("after", false, numbers, kinds, 32);
+    bool yuvPending = false;
+    for (unsigned i = 0; i < n; ++i) yuvPending |= kinds[i] == 0x4569;
+    if (context && yuvPending && receiverDumps < 2) {
+      // What the receiver's notification handler has left in the plug-in's own state: the flags it tests before it takes the YUV path, the per-slot tables
+      // Start fills, and the table the frame-done code fills from the parameter block.
+      ++receiverDumps;
+      static const struct { size_t offset, length; const char *name; } regions[] = {
+          {0x4dbe0, 0x20, "flags"}, {0x64b0, 0x10, "+64b8"},  {0xc630, 0xa0, "+c63d"},     {0x23f80, 0x20, "settings"}, {0x24280, 0x60, "settings+300"},
+          {0x6588, 0x20, "out base"}, {0x6768, 0x10, "out size"}, {0x67e0, 0x20, "param"}, {0x69c0, 0x20, "third"},     {0x6ba0, 0x30, "table"},
+          {0xc5a0, 0x40, "slice"}, {0x6678, 0x20, "out ref"}, {0x68d0, 0x20, "param ref"}};
+      for (const auto &region : regions) {
+        uint8_t bytes[0xa0] = {};
+        if (!peekUser(ownerTask, context + region.offset, bytes, region.length)) {
+          printf("rk3588-venc: ave2:   receiver +%#zx (%s): unreadable\n", region.offset, region.name);
+          continue;
+        }
+        char name[48];
+        snprintf(name, sizeof name, "receiver +%#zx %s", region.offset, region.name);
+        hexLines(name, bytes, region.length);
+      }
+    }
   }
 }
 
@@ -511,6 +718,7 @@ extern "C" void rk3588_venc_ave2_serve(void) {
   if (PE_parse_boot_argn("rk3588-venc-ave2", &value, sizeof value)) gLog = static_cast<int>(value);
   if (gLog <= 0) return;
   if (PE_parse_boot_argn("rk3588-venc-ave2-type", &value, sizeof value)) gDeviceType = value;
+  if (PE_parse_boot_argn("rk3588-venc-ave2-owner", &value, sizeof value)) gSurfaceOwner = value != 0;
   AppleAVE2Driver *service = OSTypeAlloc(AppleAVE2Driver);
   if (!service || !service->init() || !service->attach(IOService::getResourceService()) || !service->start(IOService::getResourceService())) {
     printf("rk3588-venc: ave2: could not make the service\n");
