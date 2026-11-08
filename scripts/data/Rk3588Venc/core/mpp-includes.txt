@@ -1,0 +1,20 @@
+# Include directories of the MPP checkout the encoder core's files are compiled with (paths in the checkout)
+inc
+utils
+osal
+osal/inc
+mpp/inc
+mpp/base/inc
+kmpp/inc
+kmpp/base/inc
+mpp/common
+mpp/codec/inc
+mpp/hal/inc
+mpp/hal/common
+mpp/vproc/inc
+mpp/codec/enc/h264
+mpp/codec/rc
+mpp/hal/rkenc/h264e
+mpp/hal/rkenc/common
+mpp/hal/common/h264
+mpp/hal/vpu
