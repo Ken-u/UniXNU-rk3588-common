@@ -8,10 +8,11 @@
 // the size of the structure and scalars it wants back, whether the call is asynchronous, the memory the plug-in hands over or asks for. Run the VideoToolbox
 // test (Rk3588Vdec/usertest/vt_test.c, "encoder" part) with boot argument rk3588-venc-ave2=1 and read the "ave2:" lines of the serial log.
 //
-// Boot argument rk3588-venc-ave2=N: 0 off (default), 1 register the service and log, 2 log every call in full (the default stops the hex dumps after the
-// first calls of each selector). rk3588-venc-ave2-encode=N: 1 the frames are encoded by RKVENC0 from a recorded trace (the template encoder: the trace's size,
-// quantiser and GOP), 2 H.264 frames are encoded by the encoder core (MPP's encoder: the application's size, bit rate, frame rate and key-frame interval;
-// H.265 stays on the trace).
+// Boot argument rk3588-venc-ave2=N: 0 off (default), 1 register the service and log (the first calls of each selector are described, the rest are silent),
+// 2 log every call in full, 3 also the dumps of the plug-in's first frame requests and receiver (some 3 s of serial output) and a 300 ms sleep in every call
+// (the diagnostics of the first runs). rk3588-venc-ave2-encode=N: 1 the frames are encoded by RKVENC0 from a recorded trace (the template encoder: the trace's size,
+// quantiser and GOP), 2 H.264 and H.265 frames are encoded by the encoder core (MPP's encoders: the application's size, bit rate, frame rate and key-frame
+// interval).
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOService.h>
@@ -30,7 +31,10 @@ extern "C" void proc_selfname(char *buf, int size);
 
 namespace {
 
-int gLog = 1;
+int gLog = 1;   // rk3588-venc-ave2=N: 1 the first calls of each selector are described (default), 2 every call, 3 also the dumps of the first frame requests and of the plug-in's receiver, and a 300 ms sleep after each answer
+// Whether the call being served is described (the walks of the ring and the notifications are printed): set at the start of each call. Serial lines cost real time
+// (a 150-byte line is about a millisecond at 1.5 Mbaud), so at the default level only the first three calls of each selector speak and the frame path is quiet.
+bool gTalk = true;
 // The device type the original kernel extension reports to the plug-in in the first reply (index into the 28-entry platform table that both the plug-in and
 // the kernel extension carry; entries 8 and 9 are the same family and the same function tables, 9 is the A10X's). Boot argument rk3588-venc-ave2-type.
 uint32_t gDeviceType = 9;
@@ -107,6 +111,12 @@ constexpr size_t kRootTable = 208, kRootCount = 216, kRootLock = 312, kSurfId = 
 // (The first try read the slot at its file address 0xfffffff006f339b8, which is another place in this kernel: it read 0, run ave11.)
 constexpr uintptr_t kCreateSurface = 0xfffffff004baaa24ull;
 constexpr uint32_t kCreateSurfaceWords[2] = {0xd2800003u, 0x17ffffeau};
+
+// The word of the plug-in's record that names the buffer set (slot) of a frame: the plug-in's frame-done code reads it at +0x3a8 (and a word at +0x3a4) and takes
+// the coded bytes and the per-frame parameter block from that slot's surfaces. The original kernel driver sets it to -1 when it copies a request and assigns a slot
+// before it answers. (An earlier reading of the plug-in put it at +0x46c: nothing reads that word, and as the record is zero there and +0x3a8 is zero too, every
+// frame used slot 0 without it showing.)
+constexpr size_t kSlotWord = 0x3a8;
 
 template <typename T> T field(const void *base, size_t offset) {
   T value;
@@ -339,9 +349,14 @@ class AppleAVE2UserClient : public IOUserClient {
   void notify(uint64_t counter, uint64_t second, const char *what);
   uint64_t context = 0;   // the plug-in's frame receiver (refcon of the callback)
   SurfaceMap ring;        // the plug-in's record ring, mapped in the kernel
-  static constexpr unsigned kBuffers = 4;
-  OSObject *buffers[3][kBuffers] = {};   // the data surfaces created for Start (kept until the connection closes)
-  uint32_t bufferIds[3][kBuffers] = {};
+  // Frames the plug-in may have in flight (Start's answer), and the buffer sets (slots) the frames take in turn: a frame's coded bytes stay in its slot until the
+  // plug-in's receiver has copied them out, which can be long after the next frame was answered (the receiver also delivers the sample to the application), so a
+  // slot must not be reused for the next few frames. Twice the frames in flight is the margin.
+  static constexpr unsigned kInFlight = 4;
+  static constexpr unsigned kSlots = 2 * kInFlight;
+  OSObject *buffers[3][kSlots] = {};   // the data surfaces created for Start (kept until the connection closes)
+  uint32_t bufferIds[3][kSlots] = {};
+  uint32_t nextSlot = 0;   // the slot of the next YUV request
   bool buffersMade = false;
   OSObject *headerSurface = nullptr;   // where the plug-in finds the stream headers (SPS, PPS) of the first frame: its id is in word +0x170 of the Start answer
   uint32_t headerId = 0;
@@ -453,8 +468,9 @@ unsigned AppleAVE2UserClient::walkRecords(const char *when, bool dump, uint64_t 
       uint8_t *record = ring.kva + static_cast<size_t>(i) * kRecord;
       if (!record[0]) continue;
       const uint32_t number = field<uint32_t>(record, 4), kind = field<uint32_t>(record, 0xc0);
-      printf("rk3588-venc: ave2:   ring (%s): record %u: in use, number %u, kind %#x, frame state %u, slot %u, status %#x, stamp %#llx\n", when, i, number, kind, field<uint32_t>(record, 0x5b34),
-             field<uint32_t>(record, 0x46c), field<uint32_t>(record, 0x2e4), static_cast<unsigned long long>(field<uint64_t>(record, 0x6b90)));
+      if (gTalk)
+        printf("rk3588-venc: ave2:   ring (%s): record %u: in use, number %u, kind %#x, frame state %u, slot %u, status %#x, stamp %#llx\n", when, i, number, kind, field<uint32_t>(record, 0x5b34),
+               field<uint32_t>(record, kSlotWord), field<uint32_t>(record, 0x2e4), static_cast<unsigned long long>(field<uint64_t>(record, 0x6b90)));
       if (dump) nonZeroRows("record", record, kRecord, 60);
       if (used < room) {
         numbers[used] = number;
@@ -490,7 +506,7 @@ unsigned AppleAVE2UserClient::walkRecords(const char *when, bool dump, uint64_t 
     if (!peekUser(ownerTask, address, head, sizeof head) || !peekUser(ownerTask, address + 0xc0, &kind, sizeof kind)) continue;
     memcpy(&number, head + 4, sizeof number);
     if (!head[0]) continue;
-    printf("rk3588-venc: ave2:   peek (%s): record %u at %#llx: in use, number %u, kind %#x\n", when, i, static_cast<unsigned long long>(address), number, kind);
+    if (gTalk) printf("rk3588-venc: ave2:   peek (%s): record %u at %#llx: in use, number %u, kind %#x\n", when, i, static_cast<unsigned long long>(address), number, kind);
     if (used < room) {
       numbers[used] = number;
       kinds[used] = kind;
@@ -508,7 +524,7 @@ void AppleAVE2UserClient::answerStart(uint8_t *record) {
   static const uint64_t sizes[3] = {0x100000, 0x30000, 0x100000};
   if (!buffersMade) {
     for (unsigned set = 0; set < 3; ++set)
-      for (unsigned i = 0; i < kBuffers; ++i) {
+      for (unsigned i = 0; i < kSlots; ++i) {
         buffers[set][i] = createDataSurface(gSurfaceOwner ? ownerTask : nullptr, sizes[set], &bufferIds[set][i]);
         printf("rk3588-venc: ave2:   buffer %u.%u: %llu bytes, surface id %u%s\n", set, i, static_cast<unsigned long long>(sizes[set]), bufferIds[set][i], buffers[set][i] ? "" : " (failed)");
       }
@@ -522,7 +538,7 @@ void AppleAVE2UserClient::answerStart(uint8_t *record) {
   memcpy(record + 0x170, &headerId, sizeof headerId);
   static const size_t offsets[3] = {0x174, 0x1ec, 0x264};
   for (unsigned set = 0; set < 3; ++set)
-    for (unsigned i = 0; i < kBuffers; ++i) memcpy(record + offsets[set] + 4 * i, &bufferIds[set][i], sizeof(uint32_t));
+    for (unsigned i = 0; i < kSlots; ++i) memcpy(record + offsets[set] + 4 * i, &bufferIds[set][i], sizeof(uint32_t));
 }
 
 // What the hardware would have left for a finished frame, made up: one slice. The plug-in's frame-done code takes from the slot's parameter block (set 1) the
@@ -530,8 +546,8 @@ void AppleAVE2UserClient::answerStart(uint8_t *record) {
 // header, byte +0x20c = the header's size; the first record with size 0 ends the list), and the bytes themselves from the slot's output buffer (set 0). Here
 // the header is a start code and the slice a few made-up bytes: enough for the plug-in to get as far as handing a sample to VideoToolbox, not a decodable picture.
 void AppleAVE2UserClient::fakeFrame(uint8_t *record) {
-  const uint32_t slot = field<uint32_t>(record, 0x46c);
-  if (slot >= kBuffers || !bufferIds[0][slot] || !bufferIds[1][slot]) {
+  const uint32_t slot = field<uint32_t>(record, kSlotWord);
+  if (slot >= kSlots || !bufferIds[0][slot] || !bufferIds[1][slot]) {
     printf("rk3588-venc: ave2:   fake frame: no buffers for slot %u\n", slot);
     return;
   }
@@ -616,8 +632,8 @@ unsigned splitNals(const uint8_t *p, uint32_t length, Nal *out, unsigned room, b
 // from the application's NV12 pixel buffer (the IOSurface whose id is in the request at +0x134) into the planar source picture of the trace, the next job of the
 // trace runs, and its slice NAL units go into the slot's output buffer with a slice record each; the trace's parameter sets go to the header surface.
 bool AppleAVE2UserClient::encodeFrame(uint8_t *record) {
-  const uint32_t slot = field<uint32_t>(record, 0x46c), pixelsId = field<uint32_t>(record, 0x134);
-  if (slot >= kBuffers || !bufferIds[0][slot] || !bufferIds[1][slot] || !headerSurface) return false;
+  const uint32_t slot = field<uint32_t>(record, kSlotWord), pixelsId = field<uint32_t>(record, 0x134);
+  if (slot >= kSlots || !bufferIds[0][slot] || !bufferIds[1][slot] || !headerSurface) return false;
   SurfaceMap pixels;
   if (!pixels.open(pixelsId)) {
     printf("rk3588-venc: ave2:   encode: the pixel buffer (surface %u) cannot be mapped\n", pixelsId);
@@ -809,7 +825,7 @@ bool AppleAVE2UserClient::encodeFrame(uint8_t *record) {
   const uint32_t frameType = idr ? 3 : 1;
   memcpy(record + 0x5b34, &frameType, sizeof frameType);
   if (encoded < 8 || (encoded & 31) == 0)
-    printf("rk3588-venc: ave2:   encode: frame %u: job %u, %u bytes from the block in %u us: %u NAL units, %u slices (%u bytes), %u bytes of parameter sets\n", encoded, result.job, result.length,
+    printf("rk3588-venc: ave2:   encode: frame %u (slot %u): job %u, %u bytes from the block in %u us: %u NAL units, %u slices (%u bytes), %u bytes of parameter sets\n", encoded, slot, result.job, result.length,
            result.runUs, count, slices, written, setBytes);
   ++encoded;
   out.release();
@@ -853,13 +869,13 @@ void AppleAVE2UserClient::completePending(const char *when, bool dump) {
       uint8_t *record = ring.kva + static_cast<size_t>(numbers[i] % 32) * 0x10630;
       answerStart(record);
     }
-    if (kinds[i] == 0x4569 && ring.valid() && yuvDumps < 2) {
+    if (gLog >= 3 && kinds[i] == 0x4569 && ring.valid() && yuvDumps < 2) {
       // The first frame requests: the whole record, then every parameter block (set 1) the plug-in has written into.
       ++yuvDumps;
       uint8_t *record = ring.kva + static_cast<size_t>(numbers[i] % 32) * 0x10630;
       printf("rk3588-venc: ave2:   YUV record number %llu\n", static_cast<unsigned long long>(numbers[i]));
       nonZeroRows("yuv", record, 0x10630, 500);
-      for (unsigned b = 0; b < kBuffers; ++b) {
+      for (unsigned b = 0; b < kSlots; ++b) {
         SurfaceMap block;
         if (bufferIds[1][b] && block.open(bufferIds[1][b])) {
           printf("rk3588-venc: ave2:   parameter block %u (surface %u, %llu bytes)\n", b, bufferIds[1][b], static_cast<unsigned long long>(block.length));
@@ -874,8 +890,13 @@ void AppleAVE2UserClient::completePending(const char *when, bool dump) {
       if (yuvNotified[position] == numbers[i] + 1) continue;
       yuvNotified[position] = static_cast<uint32_t>(numbers[i] + 1);
       uint8_t *yuvRecord = ring.kva + static_cast<size_t>(position) * 0x10630;
+      // The plug-in leaves the slot word (+0x3a8) at 0 and reads it back when the frame is done, so the answer chooses the slot: with every frame in slot 0 a frame
+      // was overwritten by the next one before the receiver had copied it out (runs sp1, sp2 once the 300 ms sleep was gone: a sample carried the bytes of a later
+      // frame and two frames never came out).
+      const uint32_t slot = nextSlot++ % kSlots;
+      memcpy(yuvRecord + kSlotWord, &slot, sizeof slot);
       if (!gEncode || !encodeFrame(yuvRecord)) fakeFrame(yuvRecord);
-      if (!receiverDumped) {
+      if (gLog >= 3 && !receiverDumped) {
         receiverDumped = true;
         dumpReceiver();
         uint8_t *record = ring.kva + static_cast<size_t>(position) * 0x10630;
@@ -884,7 +905,9 @@ void AppleAVE2UserClient::completePending(const char *when, bool dump) {
     }
     notify(numbers[i], 0, "request done");
   }
-  if (n) {
+  // What the plug-in's state looks like some time after the answers: a diagnostic of the first runs (rk3588-venc-ave2=3). It slept 300 ms in the plug-in's own call
+  // after every answer, which capped the encoder at three pictures a second; the answers do not depend on it.
+  if (n && gLog >= 3) {
     IOSleep(300);
     walkRecords("after", false, numbers, kinds, 32);
     bool yuvPending = false;
@@ -920,7 +943,8 @@ void AppleAVE2UserClient::notify(uint64_t counter, uint64_t second, const char *
   }
   io_user_reference_t args[3] = {counter, second, 0};
   const IOReturn kr = sendAsyncResult64(asyncReference, kIOReturnSuccess, args, 3);
-  printf("rk3588-venc: ave2:   -> notification %s: counter %llu, second %llu: %#x\n", what, static_cast<unsigned long long>(counter), static_cast<unsigned long long>(second), kr);
+  if (gTalk || kr != kIOReturnSuccess)
+    printf("rk3588-venc: ave2:   -> notification %s: counter %llu, second %llu: %#x\n", what, static_cast<unsigned long long>(counter), static_cast<unsigned long long>(second), kr);
 }
 
 // What the application asked for, in the plug-in's Prepare and Start descriptor (267944 bytes, the same settings in both; found by changing them in the VideoToolbox test:
@@ -945,10 +969,12 @@ IOReturn AppleAVE2UserClient::externalMethod(uint32_t selector, IOExternalMethod
   const unsigned call = ++calls[index];
   ++total;
   const bool full = gLog >= 2 || call <= 3;
-  printf("rk3588-venc: ave2: %s: selector %u call %u%s: scalars in %u, struct in %u%s, scalars out %u, struct out %u%s%s\n", ownerName, selector, call,
-         args->asyncWakePort ? " (asynchronous)" : "", args->scalarInputCount, args->structureInputSize, args->structureInputDescriptor ? " + descriptor" : "",
-         args->scalarOutputCount, args->structureOutputSize, args->structureOutputDescriptor ? " + descriptor" : "",
-         args->structureVariableOutputData ? " + variable output" : "");
+  gTalk = full;
+  if (full)
+    printf("rk3588-venc: ave2: %s: selector %u call %u%s: scalars in %u, struct in %u%s, scalars out %u, struct out %u%s%s\n", ownerName, selector, call,
+           args->asyncWakePort ? " (asynchronous)" : "", args->scalarInputCount, args->structureInputSize, args->structureInputDescriptor ? " + descriptor" : "",
+           args->scalarOutputCount, args->structureOutputSize, args->structureOutputDescriptor ? " + descriptor" : "",
+           args->structureVariableOutputData ? " + variable output" : "");
   if (full) {
     for (uint32_t i = 0; i < args->scalarInputCount && i < 16; ++i) printf("rk3588-venc: ave2:   scalar %u = %#llx\n", i, static_cast<unsigned long long>(args->scalarInput[i]));
     if (args->structureInput && args->structureInputSize) {
@@ -1011,7 +1037,7 @@ IOReturn AppleAVE2UserClient::externalMethod(uint32_t selector, IOExternalMethod
     // Start's 4-byte answer is how many frames the encoder keeps in flight: the plug-in sizes its two request queues ("Connection", a ring of packets) to it
     // (Connection::connectionSize, at most 16) and EncodeFrame waits for space in the first one. Zero (what the first runs returned) is a queue that is full from
     // the start: the first EncodeFrame then waited its 120 s and failed with -12912 (runs ave12..ave19: the waiting thread was inside Connection::writePacketBlock).
-    const uint32_t frames = kBuffers;
+    const uint32_t frames = kInFlight;
     memcpy(args->structureOutput, &frames, sizeof frames);
     printf("rk3588-venc: ave2:   -> frames in flight %u\n", frames);
   }
