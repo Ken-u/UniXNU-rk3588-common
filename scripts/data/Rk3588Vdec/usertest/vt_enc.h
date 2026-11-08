@@ -284,5 +284,10 @@ static void encoder_pass(unsigned pass)
    failed += run_encode(kCMVideoCodecType_H264, 640, 360, 6, 1, &second) != 0;
    failed += run_encode(kCMVideoCodecType_H264, 1920, 1080, 4, 1, &big) != 0;
    failed += run_encode(kCMVideoCodecType_H264, 480, 270, 3, 1, &odd) != 0;      /* a size with neither a trace nor a multiple of 16 rows */
+   /* the same for H.265 (the encoder core's second codec): the data rows of these sessions are named <tag>h265_... */
+   failed += run_encode(kCMVideoCodecType_HEVC, 640, 360, 16, 1, &first) != 0;
+   failed += run_encode(kCMVideoCodecType_HEVC, 640, 360, 6, 1, &second) != 0;
+   failed += run_encode(kCMVideoCodecType_HEVC, 1920, 1080, 4, 1, &big) != 0;
+   failed += run_encode(kCMVideoCodecType_HEVC, 480, 270, 3, 1, &odd) != 0;
    say("vt-enc: pass %u done, %u encoder run(s) failed", pass, failed);
 }

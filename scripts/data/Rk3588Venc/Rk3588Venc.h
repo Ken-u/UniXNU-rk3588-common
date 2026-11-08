@@ -80,7 +80,7 @@ void rk3588_venc_core_selftest(void);
 
 // ---- the encoder core behind the AppleAVE2 service (boot argument rk3588-venc-ave2-encode=2; Rk3588VencCore.cpp)
 //
-// H.264 pictures of any size, at the bit rate and with the key-frame interval the application asked for: MPP's encoder (core/) instead of a recording's trace.
+// H.264 or H.265 pictures of any size, at the bit rate and with the key-frame interval the application asked for: MPP's encoder (core/) instead of a recording's trace.
 // One stream at a time, and it shares the block and the DMA window with the template encoder above (rk3588_venc_window_claim). The core runs on a thread of
 // its own (16 KiB of kernel stack, almost all of it the core's: it goes about 5 KiB deep), the calls below wait for it.
 struct Rk3588VencCoreSettings {
@@ -88,6 +88,7 @@ struct Rk3588VencCoreSettings {
   uint32_t bitrate;           // bit/s, constant bit rate; 0: a fixed quantiser (QP 28)
   uint32_t fpsNum, fpsDen;    // 0: 30 / 1
   uint32_t gop;               // pictures between IDR pictures; 0: two seconds' worth
+  uint32_t hevc;              // 0: H.264, 1: H.265
 };
 struct Rk3588VencCoreSource {
   uint8_t *y;                 // the NV12 source picture, in the DMA window (write-combined: write it, do not read it back): `yStride` bytes per row, `vStride` rows of luma, then
@@ -95,7 +96,7 @@ struct Rk3588VencCoreSource {
   uint32_t yStride, vStride;
 };
 struct Rk3588VencCoreResult {
-  const uint8_t *data;        // Annex B, valid until the next encode call: the parameter sets (SPS, PPS) in front of an IDR picture, then the slice(s)
+  const uint8_t *data;        // Annex B, valid until the next encode call: the parameter sets (SPS, PPS; H.265: VPS, SPS, PPS) in front of an IDR picture, then the slice(s)
   uint32_t length;
   int isIdr;
   int qp;                     // what the block reported

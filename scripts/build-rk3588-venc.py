@@ -51,7 +51,7 @@ DEPLOYMENT = (2, 0x110000)   # PLATFORM_IOS, iOS 17.0
 
 # Flags of the C++ record that make no sense for a C file.
 CXX_ONLY = ('-fsized-deallocation', '-fapple-kext', '--driver-mode=g++', '-fc++-static-destructors=none')
-MPP_DEFINES = ('-DHAVE_H264E=1', '-DHW_VEPU580')
+MPP_DEFINES = ('-DHAVE_H264E=1', '-DHAVE_H265E=1', '-DHW_VEPU580')
 # Symbols that keep their names although the core defines them: the C API of VencCore.h and the shim's (prefix venc_) and the platform hooks of
 # VencPlatform.h (vec_).
 KEEP = re.compile(r'^(venc_|vec_)')
@@ -117,8 +117,6 @@ def core_sources(fetch):
     ours = includes + ['-I', str(CORE), '-w'] + defines
     sources = []
     for name in fetch.read_lines('mpp-files.txt'):
-        if name == 'mpp/codec/mpp_enc_impl.c':
-            continue   # included by VencCore.c
         sources.append((mpp / name, (shim + override, third_party)))
     sources += [(CORE / 'EncShim.c', (shim + override, ours)), (CORE / 'VencCore.c', (shim + override, ours))]
     return sources, [(CORE / 'kernel' / 'KernelLibc.c', ([], []))]

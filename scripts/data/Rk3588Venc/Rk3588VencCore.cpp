@@ -96,6 +96,7 @@ void fillPictureNv12(uint8_t *dst, uint32_t hstride, uint32_t vstride, uint32_t 
 
 struct Recipe {
   const char *name;
+  int codec;          // kVencH264 or kVencH265
   uint32_t width, height;
   unsigned frames;
   int rcMode;
@@ -106,16 +107,24 @@ struct Recipe {
 };
 // 320x240 as recorded; the others were never recorded.
 const Recipe kRecipes[] = {
-    {"c320_qp", 320, 240, 3, kVencRcFixQp, 28, 0, 0, false},
-    {"c176_cbr", 176, 144, 6, kVencRcCbr, 0, 100000, 3, false},
-    {"c640_cbr", 640, 360, 8, kVencRcCbr, 0, 600000, 4, false},
-    {"c1280_cbr", 1280, 720, 5, kVencRcCbr, 0, 2000000, 0, false},
-    {"c1920_qp", 1920, 1080, 3, kVencRcFixQp, 30, 0, 0, false},
-    {"c1366_cbr", 1366, 768, 4, kVencRcCbr, 0, 1500000, 0, false},
+    {"c320_qp", kVencH264, 320, 240, 3, kVencRcFixQp, 28, 0, 0, false},
+    {"c176_cbr", kVencH264, 176, 144, 6, kVencRcCbr, 0, 100000, 3, false},
+    {"c640_cbr", kVencH264, 640, 360, 8, kVencRcCbr, 0, 600000, 4, false},
+    {"c1280_cbr", kVencH264, 1280, 720, 5, kVencRcCbr, 0, 2000000, 0, false},
+    {"c1920_qp", kVencH264, 1920, 1080, 3, kVencRcFixQp, 30, 0, 0, false},
+    {"c1366_cbr", kVencH264, 1366, 768, 4, kVencRcCbr, 0, 1500000, 0, false},
     // semi-planar sources: what VideoToolbox's pixel buffers are
-    {"n640_cbr", 640, 360, 6, kVencRcCbr, 0, 800000, 5, true},
-    {"n1366_cbr", 1366, 768, 4, kVencRcCbr, 0, 1500000, 0, true},
-    {"n1920_qp", 1920, 1080, 2, kVencRcFixQp, 30, 0, 0, true},
+    {"n640_cbr", kVencH264, 640, 360, 6, kVencRcCbr, 0, 800000, 5, true},
+    {"n1366_cbr", kVencH264, 1366, 768, 4, kVencRcCbr, 0, 1500000, 0, true},
+    {"n1920_qp", kVencH264, 1920, 1080, 2, kVencRcFixQp, 30, 0, 0, true},
+    // the same for H.265 (the h-names): the parameter sets are a VPS, an SPS and a PPS, the pictures are coded in CTUs of 64x64
+    {"h320_qp", kVencH265, 320, 240, 3, kVencRcFixQp, 28, 0, 0, false},
+    {"h176_cbr", kVencH265, 176, 144, 6, kVencRcCbr, 0, 100000, 3, false},
+    {"h640_cbr", kVencH265, 640, 360, 8, kVencRcCbr, 0, 600000, 4, false},
+    {"h1366_cbr", kVencH265, 1366, 768, 4, kVencRcCbr, 0, 1500000, 0, false},
+    {"hn640_cbr", kVencH265, 640, 360, 6, kVencRcCbr, 0, 800000, 5, true},
+    {"hn1366_cbr", kVencH265, 1366, 768, 4, kVencRcCbr, 0, 1500000, 0, true},
+    {"hn1920_qp", kVencH265, 1920, 1080, 2, kVencRcFixQp, 30, 0, 0, true},
 };
 
 // ---- what the block's run callbacks add up to (the time the block took, on top of the work of MPP's code)
@@ -161,7 +170,7 @@ bool runRecipe(const Recipe &recipe, bool dump) {
   hw.readRegs = rk3588_venc_core_read_regs;
 
   VencParams params = {};
-  params.codec = kVencH264;
+  params.codec = recipe.codec;
   params.width = recipe.width;
   params.height = recipe.height;
   params.format = recipe.nv12 ? kVencNv12 : kVencI420;
@@ -184,13 +193,14 @@ bool runRecipe(const Recipe &recipe, bool dump) {
     printf("rk3588-venc: core %s: venc_core_create failed (%d)\n", recipe.name, rc);
     return false;
   }
-  printf("rk3588-venc: core %s: %ux%u, %u pictures, %s, created in %llu us\n", recipe.name, recipe.width, recipe.height, recipe.frames,
+  printf("rk3588-venc: core %s: %s %ux%u, %u pictures, %s, created in %llu us\n", recipe.name, recipe.codec == kVencH265 ? "H.265" : "H.264", recipe.width, recipe.height, recipe.frames,
          recipe.rcMode == kVencRcCbr ? "constant bit rate" : "fixed quantiser", static_cast<unsigned long long>(nowUs() - t0));
 
   uint8_t header[512];
   const int headerLength = venc_core_header(core, header, sizeof header);
-  if (headerLength < 8 || header[0] || header[1] || header[2] || header[3] != 1 || (header[4] & 0x1f) != 7) {
-    printf("rk3588-venc: core %s: no SPS from venc_core_header (%d)\n", recipe.name, headerLength);
+  const int firstNal = recipe.codec == kVencH265 ? (header[4] >> 1) & 0x3f : header[4] & 0x1f;   // H.265: two header bytes, the type in bits 1 to 6 of the first
+  if (headerLength < 8 || header[0] || header[1] || header[2] || header[3] != 1 || firstNal != (recipe.codec == kVencH265 ? 32 : 7)) {
+    printf("rk3588-venc: core %s: no %s from venc_core_header (%d)\n", recipe.name, recipe.codec == kVencH265 ? "VPS" : "SPS", headerLength);
     venc_core_destroy(core);
     return false;
   }
@@ -359,7 +369,7 @@ void openOnCore(void *arg) {
   s->hw.run = runCounted;
   s->hw.readRegs = rk3588_venc_core_read_regs;
   VencParams params = {};
-  params.codec = kVencH264;
+  params.codec = s->settings.hevc ? kVencH265 : kVencH264;
   params.width = s->settings.width;
   params.height = s->settings.height;
   params.format = kVencNv12;
@@ -421,8 +431,8 @@ extern "C" struct Rk3588VencCoreStream *rk3588_venc_core_open(const struct Rk358
   source->uv = base + static_cast<size_t>(s->yStride) * s->vStride;
   source->yStride = s->yStride;
   source->vStride = s->vStride;
-  printf("rk3588-venc: core stream %ux%u: %u bit/s, %u/%u frames per second, %u pictures between IDR pictures (0: two seconds), source rows of %u bytes\n", settings->width,
-         settings->height, settings->bitrate, settings->fpsNum ? settings->fpsNum : 30, settings->fpsDen ? settings->fpsDen : 1, settings->gop, s->yStride);
+  printf("rk3588-venc: core stream %s %ux%u: %u bit/s, %u/%u frames per second, %u pictures between IDR pictures (0: two seconds), source rows of %u bytes\n", settings->hevc ? "H.265" : "H.264",
+         settings->width, settings->height, settings->bitrate, settings->fpsNum ? settings->fpsNum : 30, settings->fpsDen ? settings->fpsDen : 1, settings->gop, s->yStride);
   return s;
 }
 

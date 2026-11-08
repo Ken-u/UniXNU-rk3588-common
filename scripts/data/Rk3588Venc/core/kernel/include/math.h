@@ -5,3 +5,5 @@ static inline float ceilf(float x) {
   return (float)i + (x > (float)i ? 1.0f : 0.0f);
 }
 double log(double);   // KernelLibc.c: the kernel has no math library; used by the rate control of the first frame of a re-encode
+double log2(double);   // KernelLibc.c: the H.265 register generator's log2_ctu_num
+double ceil(double);

@@ -36,7 +36,7 @@ int gLog = 1;
 uint32_t gDeviceType = 9;
 uint32_t gSessions = 0;
 bool gEncode = false;        // rk3588-venc-ave2-encode=1: the frames are encoded by the block (a trace played with the application's pictures), not made up
-bool gCore = false;          // rk3588-venc-ave2-encode=2: H.264 frames come from the encoder core (any size, the application's bit rate and key-frame interval)
+bool gCore = false;          // rk3588-venc-ave2-encode=2: H.264 and H.265 frames come from the encoder core (any size, the application's bit rate and key-frame interval)
 bool gSurfaceOwner = true;   // create the buffers for the client's task (rk3588-venc-ave2-owner=0: for nobody, as the first runs did)
 constexpr unsigned kSelectors = 64;
 
@@ -352,7 +352,7 @@ class AppleAVE2UserClient : public IOUserClient {
   bool encodeFrame(uint8_t *record);   // the block encodes the application's picture (gEncode); false: nothing was written, make one up
   Rk3588VencStream *encoder = nullptr;
   Rk3588VencPicture picture = {};
-  Rk3588VencCoreStream *coreStream = nullptr;   // gCore: the encoder core's stream (H.264), made at the first picture
+  Rk3588VencCoreStream *coreStream = nullptr;   // gCore: the encoder core's stream (H.264 or H.265), made at the first picture
   Rk3588VencCoreSource coreSource = {};
   bool coreTried = false;
   // What the application asked for, from the plug-in's Prepare / Start descriptor (words +0x1b0, +0x1c4, +0x1dc; 0: not seen)
@@ -634,7 +634,7 @@ bool AppleAVE2UserClient::encodeFrame(uint8_t *record) {
     pixels.release();
     return false;
   }
-  const bool useCore = gCore && codec == 1;
+  const bool useCore = gCore;
   Rk3588VencResult result;
   bool ok = false;
   if (useCore) {
@@ -648,6 +648,7 @@ bool AppleAVE2UserClient::encodeFrame(uint8_t *record) {
       settings.fpsNum = askedFrameRate;
       settings.fpsDen = askedFrameRate ? 1 : 0;
       settings.gop = askedKeyInterval;
+      settings.hevc = codec == 2;
       coreStream = rk3588_venc_core_open(&settings, &coreSource);
       if (!coreStream) printf("rk3588-venc: ave2:   encode: no core stream for %ux%u (the block is busy or not ready, or the core could not be set up)\n", width, height);
     }

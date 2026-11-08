@@ -138,6 +138,24 @@ double log(double x) {
   return 2 * sum + e * 0.6931471805599453;
 }
 
+// log2 and ceil, for the one place the H.265 register generator takes them: log2_ctu_num = ceil(log2(number of 64x64 units)). The number is whole, and for a power of
+// two the answer must be exact (2^e is e + log(1) / ln 2 = e: the exponent comes out of the double first), or the picture would be told it has twice the units.
+double log2(double x) {
+  if (!(x > 0)) return -1e300;
+  union {
+    double d;
+    unsigned long long u;
+  } bits = {x};
+  int e = (int)((bits.u >> 52) & 0x7ff) - 1023;
+  if (e == -1023) return -1e300;
+  bits.u = (bits.u & 0x000fffffffffffffull) | 0x3ff0000000000000ull;   // m in [1, 2)
+  return e + log(bits.d) * 1.4426950408889634;
+}
+double ceil(double x) {
+  const double truncated = (double)(long long)x;   // (values far from the range of long long are not what the register generator passes)
+  return truncated < x ? truncated + 1 : truncated;
+}
+
 // The kernel has no strcpy or strstr (it has strlcpy and strnstr); MPP's string handling in its configuration code calls these.
 char *strcpy(char *to, const char *from) {
   char *start = to;
