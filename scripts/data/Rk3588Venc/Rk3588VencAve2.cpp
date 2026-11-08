@@ -92,9 +92,13 @@ bool peekUser(task_t task, uint64_t address, void *out, size_t length) {
 // The IOSurface kext keeps its surfaces in a table indexed by id inside the IOCoreSurfaceRoot service; offsets of the original 21H461 kext (the same the
 // decoder's Surface class uses): surface +16 id, +48 the memory descriptor; root +208 the table, +216 its entry count, +312 the lock (an IOLock *).
 constexpr size_t kRootTable = 208, kRootCount = 216, kRootLock = 312, kSurfId = 16, kSurfMemory = 48;
-// The original display extension creates its surfaces with IOSurfaceRoot::createSurface(root, task = 0, properties) through the GOT slot of its stub (the stub
-// at 0xfffffff0067a28b4 is "adrp x16, 0xfffffff006f33000; ldr x16, [x16, #0x9b8]; br x16"). The kernel is not slid, so the slot has that address at run time.
-constexpr uintptr_t kCreateSurfaceSlot = 0xfffffff006f339b8ull;
+// IOSurfaceRoot::createSurface(root, task = 0, properties) of the original kext: in the kernel cache file it is at 0xfffffff005baaa24 ("mov x3, #0; b ...", a
+// thin wrapper), the original display extension calls it through the GOT slot of its stub. The original kexts are linked into our kernel 0x1000000 lower
+// (the "slide" of kernel.json: the display bindings read 0xfffffff004b9ead0 for the getter at 0xfffffff005b9ead0 of the file), so the function is at
+// 0xfffffff004baaa24 at run time (the slot at 0xfffffff005f339b8 holds that); the first two words are checked before the call.
+// (The first try read the slot at its file address 0xfffffff006f339b8, which is another place in this kernel: it read 0, run ave11.)
+constexpr uintptr_t kCreateSurface = 0xfffffff004baaa24ull;
+constexpr uint32_t kCreateSurfaceWords[2] = {0xd2800003u, 0x17ffffeau};
 
 template <typename T> T field(const void *base, size_t offset) {
   T value;
@@ -182,13 +186,14 @@ void setNumber(OSDictionary *dictionary, const char *key, uint64_t value) {
 OSObject *createDataSurface(uint64_t size, uint32_t *id) {
   *id = 0;
   IOService *root = surfaceRoot();
-  const uintptr_t slot = kCreateSurfaceSlot;
   typedef OSObject *(*CreateSurface)(IOService *, task_t, OSDictionary *);
-  CreateSurface create = *reinterpret_cast<CreateSurface *>(slot);
-  if (!root || !create || (reinterpret_cast<uintptr_t>(create) >> 40) != 0xfffffffull) {
-    printf("rk3588-venc: ave2: no IOSurface creator (root %p, function %p)\n", static_cast<void *>(root), reinterpret_cast<void *>(create));
+  const uint32_t *code = reinterpret_cast<const uint32_t *>(kCreateSurface);
+  if (!root || code[0] != kCreateSurfaceWords[0] || code[1] != kCreateSurfaceWords[1]) {
+    printf("rk3588-venc: ave2: no IOSurface creator (root %p, words %08x %08x at %p)\n", static_cast<void *>(root), root ? code[0] : 0, root ? code[1] : 0,
+           reinterpret_cast<const void *>(kCreateSurface));
     return nullptr;
   }
+  CreateSurface create = reinterpret_cast<CreateSurface>(kCreateSurface);
   OSDictionary *properties = OSDictionary::withCapacity(8);
   if (!properties) return nullptr;
   setNumber(properties, "IOSurfaceWidth", size);
@@ -229,6 +234,7 @@ class AppleAVE2UserClient : public IOUserClient {
   OSObject *buffers[3][kBuffers] = {};   // the data surfaces created for Start (kept until the connection closes)
   uint32_t bufferIds[3][kBuffers] = {};
   bool buffersMade = false;
+  unsigned yuvDumps = 0;
   unsigned walkRecords(const char *when, bool dump, uint64_t *numbers, uint32_t *kinds, unsigned room);
   void completePending(const char *when, bool dump);
   void answerStart(uint8_t *record);
@@ -388,6 +394,21 @@ void AppleAVE2UserClient::completePending(const char *when, bool dump) {
       uint8_t *record = ring.kva + static_cast<size_t>(numbers[i] % 32) * 0x10630;
       answerStart(record);
     }
+    if (kinds[i] == 0x4569 && ring.valid() && yuvDumps < 2) {
+      // The first frame requests: the whole record, then every parameter block (set 1) the plug-in has written into.
+      ++yuvDumps;
+      uint8_t *record = ring.kva + static_cast<size_t>(numbers[i] % 32) * 0x10630;
+      printf("rk3588-venc: ave2:   YUV record number %llu\n", static_cast<unsigned long long>(numbers[i]));
+      nonZeroRows("yuv", record, 0x10630, 500);
+      for (unsigned b = 0; b < kBuffers; ++b) {
+        SurfaceMap block;
+        if (bufferIds[1][b] && block.open(bufferIds[1][b])) {
+          printf("rk3588-venc: ave2:   parameter block %u (surface %u, %llu bytes)\n", b, bufferIds[1][b], static_cast<unsigned long long>(block.length));
+          nonZeroRows("param", block.kva, block.length < 0x2cab8 ? block.length : 0x2cab8, 300);
+          block.release();
+        }
+      }
+    }
     notify(numbers[i], 0, "request done");
   }
   if (n) {
@@ -472,6 +493,14 @@ IOReturn AppleAVE2UserClient::externalMethod(uint32_t selector, IOExternalMethod
       const bool ok = ring.open(ringId);
       printf("rk3588-venc: ave2:   record ring = IOSurface %u: %s (%llu bytes)\n", ringId, ok ? "mapped" : "not found", static_cast<unsigned long long>(ring.length));
     }
+  }
+  if (selector == 4 && args->structureOutput && args->structureOutputSize >= sizeof(uint32_t)) {
+    // Start's 4-byte answer is how many frames the encoder keeps in flight: the plug-in sizes its two request queues ("Connection", a ring of packets) to it
+    // (Connection::connectionSize, at most 16) and EncodeFrame waits for space in the first one. Zero (what the first runs returned) is a queue that is full from
+    // the start: the first EncodeFrame then waited its 120 s and failed with -12912 (runs ave12..ave19: the waiting thread was inside Connection::writePacketBlock).
+    const uint32_t frames = kBuffers;
+    memcpy(args->structureOutput, &frames, sizeof frames);
+    printf("rk3588-venc: ave2:   -> frames in flight %u\n", frames);
   }
   if (selector >= 3 && selector <= 8) completePending("request", call <= 2);
   return kIOReturnSuccess;
