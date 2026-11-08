@@ -8,4 +8,4 @@ if VENC_PERTURB=1 VENC_TRACES="$here/../traces" "$out/test-venc-core" > "$out/pe
   echo "mutate-core: the test PASSED with a perturbed setting: it does not look at what it should"
   exit 1
 fi
-echo "mutate-core: the perturbed run fails as it should ($(grep -c MISMATCH "$out/perturbed.log") of 6 recordings differ)"
+echo "mutate-core: the perturbed run fails as it should ($(grep -c MISMATCH "$out/perturbed.log") of 12 recordings differ)"

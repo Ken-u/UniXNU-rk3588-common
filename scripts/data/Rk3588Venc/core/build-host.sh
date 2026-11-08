@@ -12,14 +12,13 @@ CC=${CC:-cc}
 mkdir -p "$out/obj"
 inc="-I$here"
 for d in $(grep -v '^#' "$here/mpp-includes.txt" | grep -v '^$'); do inc="$inc -I$MPP/$d"; done
-defs="-DARCH_X64=1 -DARCH_X86=1 -DHAVE_H264E=1 -DHW_VEPU580 -DMPP_ENC_IMPL_C=\"$MPP/mpp/codec/mpp_enc_impl.c\""
+defs="-DARCH_X64=1 -DARCH_X86=1 -DHAVE_H264E=1 -DHAVE_H265E=1 -DHW_VEPU580 -DMPP_ENC_IMPL_C=\"$MPP/mpp/codec/mpp_enc_impl.c\""
 san=""
 [ -n "$SAN" ] && san="-fsanitize=address,undefined -fno-sanitize-recover=undefined"
 mppsan=""
 [ -n "$SAN" ] && mppsan="$san -fno-sanitize=alignment,shift"
 # MPP's own code: third-party, so no warnings (OURS_ONLY=1: only our two files, the objects of MPP's from an earlier build are kept)
 [ -n "$OURS_ONLY" ] || grep -v '^#' "$here/mpp-files.txt" | sed 's/#.*//' | grep -v '^ *$' | while read -r f; do
-  [ "$f" = mpp/codec/mpp_enc_impl.c ] && continue   # included by VencCore.c
   o="$out/obj/$(basename "$f" .c).o"
   $CC -std=gnu11 -O1 -g -fno-strict-aliasing -Wno-multichar -w $mppsan $defs $inc -include rk_type.h -c "$MPP/$f" -o "$o"
 done

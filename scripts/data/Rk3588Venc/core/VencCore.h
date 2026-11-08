@@ -60,7 +60,7 @@ enum { kVencNv12 = 0, kVencI420 = 1 };
 enum { kVencRcFixQp = 0, kVencRcCbr = 1, kVencRcVbr = 2 };   // MPP's MPP_ENC_RC_MODE_FIXQP / CBR / VBR are 2 / 1 / 0: the core maps them
 
 typedef struct VencParams {
-  int codec;                      // kVencH264 (H.265 is not in the core yet)
+  int codec;                      // kVencH264 or kVencH265
   uint32_t width, height;         // the visible picture
   uint32_t hstride, vstride;      // bytes per row of the luma plane of the source picture, rows per plane; 0: MPP's defaults (width rounded up to 16 for planar, 8 for semi-planar; height rounded up to 2)
   int format;                     // kVencNv12 or kVencI420

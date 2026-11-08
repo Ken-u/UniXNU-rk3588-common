@@ -9,7 +9,8 @@
 #     make-enc-trace.sh NAME WIDTH HEIGHT FRAMES WORKDIR [-- mpi_enc_test arguments]
 #
 # Without arguments after `--` the encoder is asked for H.264 (-t 7), YUV 4:2:0 planar input (-f 4), a fixed QP of 28 (-rc 2 -qc 28:28:28:28:28). H.265 is
-# `-- -t 16777220 -f 4 -rc 2 -qc 28:28:28:28:28`. The files left in WORKDIR: NAME.yuv (the source), NAME.fake.stream (what MPP made of the shim's fake
+# `-- -t 16777220 -f 4 -rc 2 -qc 28:28:28:28:28` and VENC_TRACE_DELIVER=job in the environment (the H.265 recordings: the shim then fills every read-back of the oldest job at
+# each poll; by default it fills one per poll, which is what the H.264 recordings were made with, see trace-shim-enc.c). The files left in WORKDIR: NAME.yuv (the source), NAME.fake.stream (what MPP made of the shim's fake
 # answers: not a real stream), NAME.rec/ (the recording), and the trace is written to ../traces/NAME.vet.
 set -e
 if [ $# -lt 5 ]; then echo "usage: MPI_ENC_TEST=... $0 NAME WIDTH HEIGHT FRAMES WORKDIR [-- mpi_enc_test arguments] (see the head of this file)"; exit 2; fi

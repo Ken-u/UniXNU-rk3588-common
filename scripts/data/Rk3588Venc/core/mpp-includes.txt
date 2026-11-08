@@ -18,3 +18,6 @@ mpp/hal/rkenc/h264e
 mpp/hal/rkenc/common
 mpp/hal/common/h264
 mpp/hal/vpu
+mpp/codec/enc/h265
+mpp/hal/rkenc/h265e
+mpp/hal/common/h265

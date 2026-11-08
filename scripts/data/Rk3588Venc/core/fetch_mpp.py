@@ -32,7 +32,7 @@ def read_lock():
 
 
 def used_files(root):
-    names = set(read_lines('mpp-files.txt'))
+    names = set(read_lines('mpp-files.txt')) | set(read_lines('mpp-included.txt'))
     for directory in read_lines('mpp-includes.txt'):
         folder = Path(root) / directory
         if folder.is_dir():

@@ -6,10 +6,10 @@
 //   - the set of registers written is the same, and each has the recorded value (the address registers: the same offset into a buffer of the same size);
 //   - the pages the CPU wrote (parameter tables, scaling lists, rate control tables; the source picture is ours, so those pages are skipped) hold the recorded bytes;
 //   - the access unit that comes back starts with the parameter sets on IDR pictures and has no more bytes than the block was said to write.
-// A core that agrees with MPP on every job of six recordings (fixed QP, constant bit rate with its feedback, IDR every third picture, three sizes) is the
-// encoder MPP is.
+// A core that agrees with MPP on every job of twelve recordings (H.264 and H.265 each: fixed QP, constant bit rate with its feedback, IDR every third picture,
+// three sizes) is the encoder MPP is.
 //
-// usage: [VENC_TRACES=DIR] [VENC_LOG=LEVEL] test-venc-core [RECORDING-NAME...]   (default: all six; MPP's own messages up to VENC_LOG, 6 is everything)
+// usage: [VENC_TRACES=DIR] [VENC_LOG=LEVEL] test-venc-core [RECORDING-NAME...]   (default: all twelve; MPP's own messages up to VENC_LOG, 6 is everything)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +69,7 @@ constexpr uint32_t kWindow = 32u << 20;
 // How each recording was made (tools/make-enc-trace.sh, UniXNU-orangepi5/evidence/host-venc-20261108.txt): MPP's test tool, planar input.
 struct Recipe {
   const char *name;
+  int codec;
   int frames;
   int rcMode;
   int qp;
@@ -76,13 +77,24 @@ struct Recipe {
   uint32_t gop;
 };
 const Recipe kRecipes[] = {
-    {"e320_h264_ip", 2, kVencRcFixQp, 28, 0, 0, 0, 0},
-    {"e320_h264_p5", 6, kVencRcFixQp, 28, 0, 0, 0, 0},
-    {"e320_h264_cbr", 6, kVencRcCbr, 0, 300000, 200000, 400000, 0},
-    {"e320_h264_gop", 7, kVencRcFixQp, 24, 0, 0, 0, 3},
-    {"e360_h264", 3, kVencRcFixQp, 30, 0, 0, 0, 0},
-    {"e720_h264", 3, kVencRcFixQp, 30, 0, 0, 0, 0},
+    {"e320_h264_ip", kVencH264, 2, kVencRcFixQp, 28, 0, 0, 0, 0},
+    {"e320_h264_p5", kVencH264, 6, kVencRcFixQp, 28, 0, 0, 0, 0},
+    {"e320_h264_cbr", kVencH264, 6, kVencRcCbr, 0, 300000, 200000, 400000, 0},
+    {"e320_h264_gop", kVencH264, 7, kVencRcFixQp, 24, 0, 0, 0, 3},
+    {"e360_h264", kVencH264, 3, kVencRcFixQp, 30, 0, 0, 0, 0},
+    {"e720_h264", kVencH264, 3, kVencRcFixQp, 30, 0, 0, 0, 0},
+    {"e320_hevc_ip", kVencH265, 2, kVencRcFixQp, 28, 0, 0, 0, 0},
+    {"e320_hevc_p5", kVencH265, 6, kVencRcFixQp, 28, 0, 0, 0, 0},
+    {"e320_hevc_cbr", kVencH265, 6, kVencRcCbr, 0, 300000, 200000, 400000, 0},
+    {"e320_hevc_gop", kVencH265, 7, kVencRcFixQp, 24, 0, 0, 0, 3},
+    {"e360_hevc", kVencH265, 3, kVencRcFixQp, 30, 0, 0, 0, 0},
+    {"e720_hevc", kVencH265, 3, kVencRcFixQp, 30, 0, 0, 0, 0},
 };
+
+// the NAL unit type of the first NAL unit after the start code at `p` (Annex B): H.264 keeps it in the low five bits of the header byte, H.265 in bits 1 to 6 of the first of two
+int nalType(int codec, const uint8_t *p) { return codec == kVencH265 ? (p[4] >> 1) & 0x3f : p[4] & 0x1f; }
+// what a stream starts with: H.264 an SPS (7), H.265 a VPS (32)
+int firstParameterSet(int codec) { return codec == kVencH265 ? 32 : 7; }
 
 struct Fake {
   std::vector<uint8_t> window;
@@ -90,6 +102,7 @@ struct Fake {
   uint32_t streamLength = 4000;
   int runs = 0;
   int reads = 0;
+  bool everyJob = false;   // H.265 recordings: every job's status was delivered; H.264: every second one
   uint32_t lastLength = 0;
 };
 
@@ -106,10 +119,12 @@ void fakeReadRegs(void *ctx, uint32_t byteOffset, uint32_t *dst, unsigned words)
   Fake *fake = static_cast<Fake *>(ctx);
   memset(dst, 0, 4u * words);
   if (byteOffset == 0x4000 && words >= 1) {
-    // st.bs_lgth_l32. tools/trace-shim-enc.c, which made the recordings, answered one queued read per poll and MPP queues two per job (the interrupt status and the
-    // status class, for two register sets in turn): the status of every second job was not delivered. The rate control saw those pictures as empty (bit_real 0),
-    // which is why the constant-bit-rate recordings have the quantiser going 23 22 25 24 27 26. The same history here.
-    fake->lastLength = (fake->reads++ & 1) ? fake->streamLength : 0;
+    // st.bs_lgth_l32. tools/trace-shim-enc.c, which made the H.264 recordings, answered one queued read per poll and MPP queues two per job (the interrupt status and
+    // the status class, for two register sets in turn): the status of every second job was not delivered. The rate control saw those pictures as empty (bit_real 0),
+    // which is why the constant-bit-rate recordings have the quantiser going 23 22 25 24 27 26. The same history here. The H.265 recordings were made with
+    // VENC_TRACE_DELIVER=job (a poll fills every read of the oldest job): there every job was done (before that the lagging answers made MPP see "enc not done" at
+    // every second job and start the next picture as an IDR).
+    fake->lastLength = (fake->everyJob || (fake->reads++ & 1)) ? fake->streamLength : 0;
     dst[0] = fake->lastLength;
   }
 }
@@ -260,6 +275,7 @@ bool runRecipe(const Recipe &recipe, const std::string &dir) {
   CHECK(trace.jobCount() == static_cast<uint32_t>(recipe.frames));
 
   Fake fake;
+  fake.everyJob = recipe.codec == kVencH265;
   fake.window.assign(kWindow + 4096, 0);
   fake.base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(fake.window.data()) + 4095) & ~uintptr_t(4095));
   VencHw hw = {};
@@ -271,7 +287,7 @@ bool runRecipe(const Recipe &recipe, const std::string &dir) {
   hw.readRegs = fakeReadRegs;
 
   VencParams params = {};
-  params.codec = kVencH264;
+  params.codec = recipe.codec;
   params.width = trace.width();
   params.height = trace.height();
   params.format = kVencI420;
@@ -308,7 +324,7 @@ bool runRecipe(const Recipe &recipe, const std::string &dir) {
   uint8_t header[512];
   const int headerLength = venc_core_header(core, header, sizeof header);
   CHECK(headerLength > 8);
-  CHECK(header[0] == 0 && header[1] == 0 && header[2] == 0 && header[3] == 1 && (header[4] & 0x1f) == 7);   // an SPS first, Annex B
+  CHECK(header[0] == 0 && header[1] == 0 && header[2] == 0 && header[3] == 1 && nalType(recipe.codec, header) == firstParameterSet(recipe.codec));   // an SPS (a VPS) first, Annex B
 
   uint32_t sourceBytes = 0;
   uint8_t *source = venc_core_source(core, &sourceBytes);
@@ -331,7 +347,7 @@ bool runRecipe(const Recipe &recipe, const std::string &dir) {
     if (idr && f > 0) {
       CHECK(packet.hwOffset > 0);   // parameter sets in front
       CHECK(packet.data[0] == 0 && packet.data[1] == 0 && packet.data[2] == 0 && packet.data[3] == 1);
-      CHECK((packet.data[4] & 0x1f) == 7);   // an SPS first
+      CHECK(nalType(recipe.codec, packet.data) == firstParameterSet(recipe.codec));   // an SPS (a VPS) first
     }
     if (f == 0 && (recipe.rcMode != kVencRcFixQp || recipe.gop)) printf("  %s picture %d: %u bytes, qp %d, idr %d\n", recipe.name, f, packet.length, packet.qp, packet.isIdr);
   }
@@ -359,6 +375,7 @@ struct Smoke {
   uint32_t bitrate, gop;
   int frames;
   int forceIdrAt;   // a picture index, or -1
+  int codec = kVencH264;   // or kVencH265
 };
 
 struct Outcome {
@@ -373,6 +390,7 @@ void collectQp(void *ctx, const VencJobInfo *info) { static_cast<std::vector<int
 Outcome runSmoke(const Smoke &sm, const std::vector<std::pair<int, std::pair<const char *, int>>> &changes = {}) {
   Outcome out = {};
   Fake fake;
+  fake.everyJob = sm.codec == kVencH265;   // as with the H.265 recordings: every job's status is delivered
   fake.window.assign(kWindow + 4096, 0);
   fake.base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(fake.window.data()) + 4095) & ~uintptr_t(4095));
   VencHw hw = {};
@@ -383,7 +401,7 @@ Outcome runSmoke(const Smoke &sm, const std::vector<std::pair<int, std::pair<con
   hw.run = fakeRun;
   hw.readRegs = fakeReadRegs;
   VencParams params = {};
-  params.codec = kVencH264;
+  params.codec = sm.codec;
   params.width = sm.width;
   params.height = sm.height;
   params.format = sm.format;
@@ -406,6 +424,7 @@ Outcome runSmoke(const Smoke &sm, const std::vector<std::pair<int, std::pair<con
   uint8_t header[512];
   const int headerLength = venc_core_header(core, header, sizeof header);
   CHECK(headerLength > 8);
+  CHECK(headerLength > 8 && nalType(sm.codec, header) == firstParameterSet(sm.codec));
   uint32_t sourceBytes = 0;
   uint8_t *source = venc_core_source(core, &sourceBytes);
   CHECK(source != nullptr);
@@ -429,7 +448,7 @@ Outcome runSmoke(const Smoke &sm, const std::vector<std::pair<int, std::pair<con
     CHECK(packet.data != nullptr);
     CHECK(packet.length == packet.hwOffset + fake.lastLength);
     CHECK(packet.data >= fake.base && packet.data + packet.length <= fake.base + kWindow);
-    const bool startsWithSps = packet.hwOffset > 0 && packet.data[0] == 0 && packet.data[1] == 0 && packet.data[2] == 0 && packet.data[3] == 1 && (packet.data[4] & 0x1f) == 7;
+    const bool startsWithSps = packet.hwOffset > 0 && packet.data[0] == 0 && packet.data[1] == 0 && packet.data[2] == 0 && packet.data[3] == 1 && nalType(sm.codec, packet.data) == firstParameterSet(sm.codec);
     if (packet.isIdr && f > 0) CHECK(startsWithSps);
     if (!packet.isIdr) CHECK(packet.hwOffset == 0 || !startsWithSps);
     if (packet.isIdr) out.idr.push_back(f);
@@ -451,6 +470,13 @@ bool runSmokes() {
       {"s1366x768_nv12_cbr", 1366, 768, kVencNv12, kVencRcCbr, 0, 3000000, 4, 9, 6},
       {"s1920x1080_i420_qp", 1920, 1080, kVencI420, kVencRcFixQp, 28, 0, 0, 3, -1},
       {"s1920x1080_nv12_cbr", 1920, 1080, kVencNv12, kVencRcCbr, 0, 6000000, 30, 3, -1},
+      {"h176_i420_qp", 176, 144, kVencI420, kVencRcFixQp, 26, 0, 0, 4, -1, kVencH265},
+      {"h322x242_nv12_qp", 322, 242, kVencNv12, kVencRcFixQp, 30, 0, 0, 4, -1, kVencH265},
+      {"h640x480_i420_cbr", 640, 480, kVencI420, kVencRcCbr, 0, 800000, 5, 12, -1, kVencH265},
+      {"h640x360_nv12_vbr", 640, 360, kVencNv12, kVencRcVbr, 0, 1000000, 0, 6, -1, kVencH265},
+      {"h1366x768_nv12_cbr", 1366, 768, kVencNv12, kVencRcCbr, 0, 3000000, 4, 9, 6, kVencH265},
+      {"h1920x1080_i420_qp", 1920, 1080, kVencI420, kVencRcFixQp, 28, 0, 0, 3, -1, kVencH265},
+      {"h1920x1080_nv12_cbr", 1920, 1080, kVencNv12, kVencRcCbr, 0, 6000000, 30, 3, -1, kVencH265},
   };
   for (const Smoke &sm : smokes) {
     const Outcome o = runSmoke(sm);
@@ -464,30 +490,32 @@ bool runSmokes() {
     for (int q : o.qp) printf(" %d", q);
     printf(", window peak %u KiB\n", o.stats.windowPeakBytes >> 10);
   }
-  // the rate control moves the quantiser the right way: the fake block writes 4000 bytes per picture (960 kbit/s at 30 fps)
-  {
-    const Smoke low = {"rate_low", 640, 360, kVencI420, kVencRcCbr, 0, 100000, 0, 12, -1};
-    const Smoke high = {"rate_high", 640, 360, kVencI420, kVencRcCbr, 0, 8000000, 0, 12, -1};
-    const Outcome a = runSmoke(low), b = runSmoke(high);
-    CHECK(a.qp.size() == 12 && b.qp.size() == 12);
-    if (a.qp.size() == 12 && b.qp.size() == 12) {
-      printf("%-22s qp %d -> %d at 100 kbit/s, %d -> %d at 8 Mbit/s\n", "rate control", a.qp[2], a.qp[11], b.qp[2], b.qp[11]);
-      CHECK(a.qp[11] > b.qp[11]);   // far too many bits for 100 kbit/s: a coarser quantiser than for 8 Mbit/s
-      CHECK(a.qp[11] >= a.qp[2]);   // (45 is where the quantiser of a 100 kbit/s stream already is on the first inter picture)
-      CHECK(b.qp[11] < b.qp[2]);
+  for (const int codec : {kVencH264, kVencH265}) {
+    // the rate control moves the quantiser the right way: the fake block writes 4000 bytes per picture (960 kbit/s at 30 fps)
+    {
+      const Smoke low = {"rate_low", 640, 360, kVencI420, kVencRcCbr, 0, 100000, 0, 12, -1, codec};
+      const Smoke high = {"rate_high", 640, 360, kVencI420, kVencRcCbr, 0, 8000000, 0, 12, -1, codec};
+      const Outcome a = runSmoke(low), b = runSmoke(high);
+      CHECK(a.qp.size() == 12 && b.qp.size() == 12);
+      if (a.qp.size() == 12 && b.qp.size() == 12) {
+        printf("%-22s qp %d -> %d at 100 kbit/s, %d -> %d at 8 Mbit/s\n", codec == kVencH265 ? "rate control (h265)" : "rate control", a.qp[2], a.qp[11], b.qp[2], b.qp[11]);
+        CHECK(a.qp[11] > b.qp[11]);   // far too many bits for 100 kbit/s: a coarser quantiser than for 8 Mbit/s
+        CHECK(a.qp[11] >= a.qp[2]);   // (45 is where the quantiser of a 100 kbit/s stream already is on the first inter picture)
+        CHECK(b.qp[11] < b.qp[2]);
+      }
     }
-  }
-  // settings changed between pictures are taken up: a new key frame interval, a new bit rate
-  {
-    const Smoke sm = {"changes", 640, 360, kVencI420, kVencRcCbr, 0, 2000000, 0, 14, -1};
-    const std::vector<std::pair<int, std::pair<const char *, int>>> changes = {{5, {"rc:gop", 4}}, {8, {"rc:bps_target", 200000}}, {8, {"rc:bps_max", 250000}}, {8, {"rc:bps_min", 150000}}};
-    const Outcome o = runSmoke(sm, changes);
-    printf("%-22s IDR at", "changed settings");
-    for (int f : o.idr) printf(" %d", f);
-    printf(", qp");
-    for (int q : o.qp) printf(" %d", q);
-    printf("\n");
-    CHECK(o.idr.size() >= 3);   // 0, and every 4th from the change on (the interval counts from the last IDR)
+    // settings changed between pictures are taken up: a new key frame interval, a new bit rate
+    {
+      const Smoke sm = {"changes", 640, 360, kVencI420, kVencRcCbr, 0, 2000000, 0, 14, -1, codec};
+      const std::vector<std::pair<int, std::pair<const char *, int>>> changes = {{5, {"rc:gop", 4}}, {8, {"rc:bps_target", 200000}}, {8, {"rc:bps_max", 250000}}, {8, {"rc:bps_min", 150000}}};
+      const Outcome o = runSmoke(sm, changes);
+      printf("%-22s IDR at", codec == kVencH265 ? "changed settings (h265)" : "changed settings");
+      for (int f : o.idr) printf(" %d", f);
+      printf(", qp");
+      for (int q : o.qp) printf(" %d", q);
+      printf("\n");
+      CHECK(o.idr.size() >= 3);   // 0, and every 4th from the change on (the interval counts from the last IDR)
+    }
   }
   return gFailures == before;
 }

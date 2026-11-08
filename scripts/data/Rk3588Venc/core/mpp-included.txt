@@ -1,0 +1,4 @@
+# Files of the MPP checkout that belong to the locked tree and are compiled as part of another file (they are #included, so a build of their own would fail), not on their own:
+# the controller thread's source, which core/VencCore.c includes to reach its static step functions, and the vepu580 H.265 register generator's tuning part.
+mpp/codec/mpp_enc_impl.c
+mpp/hal/rkenc/h265e/hal_h265e_vepu580_tune.c

@@ -42,6 +42,7 @@
 #include "mpp_impl.h"
 #include "hal_hw_id.h"
 #include "mpp_platform.h"
+#include "mpp_service.h"
 
 // ------------------------------------------------------------------------------------------------------------------------------------------------
 // memory, log, environment, singletons
@@ -721,6 +722,14 @@ typedef struct ShimDev {
   VencRun sendRuns[kRegs / 2 + 1];
   VencJobInfo sendInfo;
 } ShimDev;
+
+// osal/mpp_platform.c: which commands the kernel service of the vendor driver supports. There is no service here. hal_h265e_vepu580.c reads send_cmd to decide whether the tiles of a
+// picture may run in parallel (send_cmd above MPP_CMD_SET_SESSION_FD); the answer of a host without /proc/mpp_service, which is what the recordings were made on, is all zero:
+// one tile after the other, and a picture without tiles (all we make) does not care (checked: send_cmd set high, all twelve recordings still match).
+const MppServiceCmdCap *mpp_get_mpp_service_cmd_cap(void) {
+  static const MppServiceCmdCap cap;
+  return &cap;
+}
 
 MPP_RET mpp_dev_init(MppDev *ctx, MppClientType type) {
   (void)type;

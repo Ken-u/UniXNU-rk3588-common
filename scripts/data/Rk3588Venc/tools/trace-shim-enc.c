@@ -10,7 +10,8 @@
 // (parameter sets, rate control, reference management, register generator). The board side replays them (relocating the buffers) and checks what the block
 // writes by decoding it.
 //
-// Environment: VENC_TRACE_DIR = output directory (created). Files: jobNNN.json (registers, relocations, offsets, rcb, info), bufB_jobNNN.bin (the content
+// Environment: VENC_TRACE_DELIVER=job: a poll fills every read-back of the oldest job (the H.265 recordings; the default fills one per poll, the H.264 ones).
+// VENC_TRACE_DIR = output directory (created). Files: jobNNN.json (registers, relocations, offsets, rcb, info), bufB_jobNNN.bin (the content
 // of buffer B at that job's submission, only when it changed since the last dump).
 //
 // The shape of the protocol follows MPP's osal/driver/mpp_service.c (the user side) and the vendor kernel's mpp_service.c / mpp_rkvdec2.c (the kernel side).
@@ -58,6 +59,8 @@ static InfoCfg gInfo[32]; static int gNInfo;
 static int gJob;
 static uint32_t gClientType;
 static struct { void *p; uint32_t size, offset; } gRdQ[64]; static int gRdHead, gRdTail;   // read-back slots (MPP_CMD_SET_REG_READ) of the submitted jobs, oldest first
+static int gRdJobEnd[64], gJobsSubmitted, gJobsPolled;   // where each submitted job's read-back slots end in gRdQ (VENC_TRACE_DELIVER=job)
+static int gDeliverJob;                                      // 1: a poll fills all the read-back slots of the oldest submitted job; 0 (the default): one slot per poll
 static int gBatchHasWrite;
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;   // MPP's parser and HAL threads call ioctl at the same time (H.265 parses the next picture while the last one is submitted); a batch is handled whole
 
@@ -67,6 +70,7 @@ static void init(void) {
   real_close = dlsym(RTLD_NEXT, "close");
   real_access = dlsym(RTLD_NEXT, "access");
   real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+  { const char *m = getenv("VENC_TRACE_DELIVER"); gDeliverJob = m && !strcmp(m, "job"); }
 }
 
 static int mkfdfile(const char *content, size_t len) {
@@ -191,6 +195,7 @@ static void finish_job(void) {
   fprintf(f, "\n ]\n}\n");
   fclose(f);
   fprintf(stderr, "trace-shim-enc: job %d std %u recorded (%d offsets)\n", gJob, std, gNOffs);
+  gRdJobEnd[gJobsSubmitted++ % 64] = gRdTail;
   gJob++;
   memset(gRegSet, 0, sizeof gRegSet); memset(gRegs, 0, sizeof gRegs);
   gNOffs = gNRcb = gNInfo = 0;
@@ -235,7 +240,11 @@ static int mpp_request(ReqV1 *r) {
       return 0;
     }
     case 0x300: case 0x301: {                                   // POLL_HW_FINISH / POLL_HW_IRQ: the oldest submitted job is done
-      if (gRdHead != gRdTail) {
+      // Default (the H.264 recordings): ONE queued slot per poll while MPP queues two per job (the interrupt status and the status class), so the answers lag behind the jobs
+      // and some jobs see "not done" or a length of 0. With VENC_TRACE_DELIVER=job (the H.265 recordings) the poll fills every slot of the oldest submitted job: every job is done.
+      int upto = gDeliverJob ? (gJobsPolled < gJobsSubmitted ? gRdJobEnd[gJobsPolled % 64] : gRdTail) : gRdHead + 1;
+      if (gDeliverJob) gJobsPolled++;
+      while (gRdHead != gRdTail && gRdHead != upto) {
         int i = gRdHead++ % 64;
         uint32_t *p = gRdQ[i].p; memset(p, 0, gRdQ[i].size);
         if (gRdQ[i].offset == 0x2c && gRdQ[i].size >= 4) p[0] = 0x1;            // int_sta: encode done, no error bits

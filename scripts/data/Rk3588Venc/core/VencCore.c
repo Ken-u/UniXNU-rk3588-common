@@ -25,6 +25,7 @@
 #include "mpp_buffer.h"
 #include "mpp_list.h"
 #include "hal_h264e_vepu580.h"
+#include "hal_h265e_vepu580.h"
 #include "rk_venc_cmd.h"
 #include "rk_venc_cfg.h"
 
@@ -46,8 +47,10 @@ struct VencCore {
 
 static VencCore *gOpen;
 
-// the tables of MPP's test tool (utils/mpi_enc_utils.c), copied; the hardware's adaptive quantisation (thresholds and QP steps by motion class) and the quantiser bias
+// the tables of MPP's test tool (utils/mpi_enc_utils.c), copied (the quantiser bias tables are per codec); the hardware's adaptive quantisation (thresholds and QP steps by motion class) and the quantiser bias
 static RK_S32 kQbiasAvc[18] = {3, 6, 13, 683, 683, 683, 683, 3, 6, 13, 683, 683, 683, 683, 341, 341, 341, 341};
+// (the vepu580 H.265 front end does not read hw:qbias_arr, only hw:qbias_i/p; the vepu511 one does. Setting it as the test tool does costs nothing; checked: with the H.264 table in its place all twelve recordings still match)
+static RK_S32 kQbiasHevc[18] = {3, 6, 13, 171, 171, 171, 171, 3, 6, 13, 171, 171, 220, 171, 85, 85, 85, 85};
 static RK_S32 kAqRange[10] = {5, 5, 10, 12, 12, 5, 5, 10, 12, 12};
 static RK_S32 kAqThd[16] = {0, 0, 0, 0, 3, 3, 5, 5, 8, 8, 8, 15, 15, 20, 25, 25};
 static RK_S32 kAqStepI[16] = {-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 5, 7, 7, 8};
@@ -66,6 +69,8 @@ static int core_control(VencCore *core, MpiCmd cmd, void *param) {
   return ret ? -1 : 0;
 }
 
+static MppCodingType coding_of(int codec) { return codec == kVencH265 ? MPP_VIDEO_CodingHEVC : MPP_VIDEO_CodingAVC; }
+
 static int rc_mode_of(int mode) {
   switch (mode) {
     case kVencRcFixQp: return MPP_ENC_RC_MODE_FIXQP;
@@ -74,7 +79,7 @@ static int rc_mode_of(int mode) {
   }
 }
 
-// mpi_enc_cfg_setup() of MPP's test tool (utils/mpi_enc_utils.c) for H.264, with its command line values at their defaults
+// mpi_enc_cfg_setup() of MPP's test tool (utils/mpi_enc_utils.c) for H.264 and H.265, with its command line values at their defaults
 // every setting must be taken: a name MPP does not know is a mistake of ours (or a different MPP), not something to go on from
 #define CFG_S32(name, value) do { if (mpp_enc_cfg_set_s32(cfg, name, value)) { vec_log(2, "venc: MPP does not take " name); return -1; } } while (0)
 #define CFG_U32(name, value) do { if (mpp_enc_cfg_set_u32(cfg, name, value)) { vec_log(2, "venc: MPP does not take " name); return -1; } } while (0)
@@ -88,7 +93,7 @@ static int core_configure(VencCore *core) {
   int bps = p->bitrate ? (int)p->bitrate : (int)(p->width * p->height / 8 * (uint32_t)(fpsNum / fpsDen));
   int gop = p->gop ? (int)p->gop : fpsNum * 2;
 
-  CFG_S32("codec:type", MPP_VIDEO_CodingAVC);
+  CFG_S32("codec:type", coding_of(p->codec));
   CFG_S32("prep:width", (RK_S32)p->width);
   CFG_S32("prep:height", (RK_S32)p->height);
   CFG_S32("prep:hor_stride", (RK_S32)core->hstride);
@@ -175,11 +180,15 @@ static int core_configure(VencCore *core) {
     CFG_S32("rc:fqp_max_p", 45);
   }
 
-  CFG_S32("h264:profile", p->profile ? p->profile : 100);
-  CFG_S32("h264:level", p->level ? p->level : 40);
-  CFG_S32("h264:cabac_en", p->cabac < 0 ? 0 : 1);
-  CFG_S32("h264:cabac_idc", 0);
-  CFG_S32("h264:trans8x8", 1);
+  if (p->codec == kVencH265) {
+    CFG_S32("h265:diff_cu_qp_delta_depth", 0);   // the test tool's -qpdd default
+  } else {
+    CFG_S32("h264:profile", p->profile ? p->profile : 100);
+    CFG_S32("h264:level", p->level ? p->level : 40);
+    CFG_S32("h264:cabac_en", p->cabac < 0 ? 0 : 1);
+    CFG_S32("h264:cabac_idc", 0);
+    CFG_S32("h264:trans8x8", 1);
+  }
 
   CFG_S32("rc:gop", gop);
 
@@ -189,13 +198,13 @@ static int core_configure(VencCore *core) {
   CFG_ST("hw:aq_step_i", kAqStepI);
   CFG_ST("hw:aq_step_p", kAqStepP);
   CFG_ST("hw:aq_rnge_arr", kAqRange);
-  CFG_ST("hw:qbias_arr", kQbiasAvc);
+  CFG_ST("hw:qbias_arr", p->codec == kVencH265 ? kQbiasHevc : kQbiasAvc);
 
   if (core_control(core, MPP_ENC_SET_CFG, cfg)) return -1;
 
   {
     RcApiBrief brief;
-    brief.type = MPP_VIDEO_CodingAVC;
+    brief.type = coding_of(p->codec);
     brief.name = "default";
     if (core_control(core, MPP_ENC_SET_RC_API_CURRENT, &brief)) return -1;
   }
@@ -218,12 +227,12 @@ int venc_core_create(VencCore **out, const VencHw *hw, const VencParams *params)
 
   *out = NULL;
   if (gOpen) return -1;
-  if (params->codec != kVencH264) return -1;
+  if (params->codec != kVencH264 && params->codec != kVencH265) return -1;
   if (!params->width || !params->height || params->width > 4096 || params->height > 4096) return -1;
 
   venc_shim_bind(hw);
   if (venc_shim_run_singletons()) return -2;
-  mpp_enc_hal_api_register(&hal_h264e_vepu580);
+  mpp_enc_hal_api_register(params->codec == kVencH265 ? &hal_h265e_vepu580 : &hal_h264e_vepu580);
 
   core = (VencCore *)vec_calloc(sizeof *core);
   if (!core) return -3;
@@ -236,7 +245,7 @@ int venc_core_create(VencCore **out, const VencHw *hw, const VencParams *params)
   core->sourceBytes = align_up(core->hstride, 64u) * align_up(core->vstride, 64u) * 3 / 2;
   mpp = &core->mpp;
   mpp->mType = MPP_CTX_ENC;
-  mpp->mCoding = MPP_VIDEO_CodingAVC;
+  mpp->mCoding = coding_of(params->codec);
   mpp->mInputTaskCount = 1;
   mpp->mOutputTaskCount = 8;
   mpp->mInputTimeout = MPP_POLL_BLOCK;
@@ -256,7 +265,7 @@ int venc_core_create(VencCore **out, const VencHw *hw, const VencParams *params)
   core->frameGroup = mpp->mFrameGroup;
   core->packetGroup = mpp->mPacketGroup;
 
-  initCfg.coding = MPP_VIDEO_CodingAVC;
+  initCfg.coding = coding_of(params->codec);
   initCfg.task_cnt = mpp->mInputTaskCount;
   initCfg.mpp = mpp;
   if (mpp_enc_init_v2(&mpp->mEnc, &initCfg)) {

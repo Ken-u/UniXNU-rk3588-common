@@ -1,5 +1,5 @@
 # The files of Rockchip's MPP (rockchip-linux/mpp, Apache-2.0) the encoder core compiles unmodified, as paths in the checkout pinned by mpp.lock.
-# The H.264 encoder: codec (parameter sets, slice headers, DPB), rate control, controller pieces, the vepu580 register generator, the config and object
+# The H.264 and H.265 encoders: codec (parameter sets, slice headers, DPB), rate control, controller pieces, the vepu580 register generator, the config and object
 # machinery (kmpp objects: the settings are named fields of tables), frames, packets, tasks and ports.
 
 # codec: H.264 syntax and reference handling
@@ -11,8 +11,17 @@ mpp/codec/enc/h264/h264e_slice.c
 mpp/codec/enc/h264/h264e_sps.c
 mpp/codec/enc_impl.c
 
+# codec: H.265 syntax and reference handling (parameter sets, slice headers, DPB, the entropy coder of the SEI/headers)
+mpp/codec/enc/h265/h265e_api.c
+mpp/codec/enc/h265/h265e_dpb.c
+mpp/codec/enc/h265/h265e_enctropy.c
+mpp/codec/enc/h265/h265e_header_gen.c
+mpp/codec/enc/h265/h265e_ps.c
+mpp/codec/enc/h265/h265e_slice.c
+mpp/codec/enc/h265/h265e_stream.c
+mpp/codec/enc/h265/h265e_syntax.c
+
 # controller (mpp_enc_impl.c holds the thread body of MPP's encoder: core/VencCore.c includes it, so it is not compiled on its own, and drives its steps itself)
-mpp/codec/mpp_enc_impl.c
 mpp/codec/mpp_enc_v2.c
 mpp/codec/mpp_rc.c
 
@@ -49,7 +58,7 @@ kmpp/base/kmpp_meta.c
 kmpp/base/kmpp_venc_cfg.c
 kmpp/base/kmpp_info.c
 
-# hal: the vepu580 H.264 register generator
+# hal: the vepu580 H.264 and H.265 register generators
 mpp/hal/mpp_enc_hal.c
 mpp/hal/hal_task.c
 mpp/hal/common/hal_info.c
@@ -59,6 +68,8 @@ mpp/hal/rkenc/common/vepu580_common.c
 mpp/hal/rkenc/common/vepu5xx_common.c
 mpp/hal/rkenc/common/vepu580_tune.c
 mpp/hal/common/h264/hal_h264e_stream_amend.c
+mpp/hal/rkenc/h265e/hal_h265e_vepu580.c
+mpp/hal/common/h265/hal_h265e_stream_amend.c
 
 # osal
 osal/mpp_mem_pool.c
