@@ -433,6 +433,7 @@ void vencThread(void *, wait_result_t) {
 }  // namespace
 
 extern "C" void rk3588_venc_start(void) {
+  rk3588_venc_ave2_serve();   // its own boot argument (rk3588-venc-ave2): no hardware is touched
   gMode = bootArg("rk3588-venc", 0);
   if (!gMode) return;
   printf("rk3588-venc: mode %u\n", gMode);

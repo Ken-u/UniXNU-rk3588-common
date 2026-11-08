@@ -36,6 +36,9 @@ extern const struct Rk3588VencConfig rk3588_venc_config;
 // Called by the board's probe once the kernel is up; reads the boot arguments and returns at once without rk3588-venc=N.
 void rk3588_venc_start(void);
 
+// Registers the AppleAVE2Driver service (the logging stage, Rk3588VencAve2.cpp) when the boot argument rk3588-venc-ave2=N is set; called by rk3588_venc_start().
+void rk3588_venc_ave2_serve(void);
+
 #ifdef __cplusplus
 }
 #endif

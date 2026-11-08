@@ -15,6 +15,9 @@
  *      of the output depends on the stream's reordering).
  *   4. The same with the hardware decoder required: with the service this must work; without it, VideoToolbox reports that it found none.
  *
+ * The encoder part (vt_enc.h, only when the kernel command line has rk3588-venc-ave2, passes 0 and 1): a hardware-required VTCompressionSession for
+ * H.264 and H.265 on synthetic NV12 pictures.
+ *
  * Build: usertest/build.sh (clang -target arm64-apple-ios17.0, signed ad hoc; the cdhash goes into the owner trust bundle).
  */
 #include <dlfcn.h>
@@ -297,6 +300,8 @@ static void cf_set_int(CFMutableDictionaryRef dict, CFStringRef key, int value)
    CFRelease(number);
 }
 
+#include "vt_enc.h"   /* the encoder part: encoder_pass(), enc_wanted() */
+
 static int run_stream(const struct VtStream *stream, int requireHardware)
 {
    struct parsed *parsed = malloc(sizeof *parsed);
@@ -476,6 +481,8 @@ int main(void)
       if (pass)
          sleep(pass == 1 ? 60 : 30);
       say("vt: pass %u", pass);
+      if (pass < 2 && enc_wanted())
+         encoder_pass(pass);
       probe_service();
       say("vt: VTIsHardwareDecodeSupported(H.264): %d, (HEVC): %d", VTIsHardwareDecodeSupported(kCMVideoCodecType_H264),
           VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC));
